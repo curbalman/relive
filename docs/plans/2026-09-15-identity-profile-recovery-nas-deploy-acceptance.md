@@ -12,9 +12,9 @@
 | NAS 已编译 | **通过** | 应用镜像与 Linux `verify.bin` 均在 NAS 构建 |
 | 副本通过 | **通过** | 六项必需检查全部 pass，`ok=true`，退出码 0 |
 | 生产已切换 | **通过** | `relive:local` 已指向新镜像，健康检查 healthy |
-| 线上验收通过 | **未完成** | 部署完成；已观察到画像后台切片，但 ANN 因持续 `iowait_high` 尚未就绪，部署后尚未观察到合并推荐自然巡检轮次 |
+| 线上验收通过 | **通过** | ANN `ready=true`（成功重建）；部署后已观察到合并推荐自然巡检（`last_run_at`/logs/cursor 更新） |
 
-**整体结论：代码交付、NAS 构建、独立副本与生产切换均已完成；线上验收因 ANN/合并巡检关键路径尚未在部署后自然跑通，标记为“部署完成、线上验收未完成”。未发生回退。**
+**整体结论：五项门禁全部通过。部署 SHA 仍为 `6413beef…`；线上验收于 2026-09-15 21:05+08 补齐。未发生回退。**
 
 ---
 
@@ -166,37 +166,43 @@
   - `356935`：ready / usable，centers=5
   - `306601` / `307945` / `562545`：ready，centers=0（空证据类；与副本 waiting_evidence 语义一致的空结果，非技术失败冒充）
 
-### 6.2 API 核对（认证调用，凭据未入日志）
+### 6.2 第一阶段快照（切换后约 20:43–20:54，线上验收当时未完成）
+
+| 接口 | 当时结果 |
+| --- | --- |
+| identity-profiles/stats | mode=primary；dirty≈1.5k；failed 14→3；ANN 尚未 ready（反复 `iowait_high` 跳过重建） |
+| merge-suggestions/* | `paused=false`；`last_run_at` 仍为部署前 `00:20`；pending=0；failures=0；logs 空 |
+
+该阶段不能把零 pending 解释为“巡检后无候选”，只能说明等待 ANN/巡检。
+
+### 6.3 续验完成（2026-09-15 20:55–21:06+08）
+
+| 里程碑 | 证据 |
+| --- | --- |
+| ANN 就绪 | 日志 `Identity profile ANN: rebuild succeeded centers=14152 generation=1 elapsed=53270ms`（20:55:53）；API `ready=true`、`last_build_status=success`、`snapshot_nodes=14152`、`rebuild_requested=false` |
+| 合并自然巡检 | `last_run_at`：`2026-09-15T00:20:06+08:00` → **`2026-09-15T21:05:56.895611423+08:00`**；`cursor_target_id`：0 → **272318**；task 文案「完成 100 个目标人物巡检」；`processed_pairs=0` |
+| background/logs | 3 行，含 ANN 重建完成与「完成 100 个目标人物巡检」 |
+
+续验后 API 核对（与 UI 一致）：
 
 | 接口 | 结果要点 |
 | --- | --- |
-| identity-profiles/stats | mode=primary；dirty 约 1.5k；failed 从 14 → 3（观测窗口内下降） |
-| merge-suggestions/task | `idle` /「等待巡检」；`paused=false` |
+| identity-profiles/stats | ANN ready；dirty≈1563；failed=3；coordinator 持续切片 |
+| merge-suggestions/task | idle；「完成 100 个目标人物巡检」；`started_at`/`stopped_at`=21:05:56 |
 | merge-suggestions/stats | pending=0；历史 total=20856 |
 | merge-suggestions | pending 列表 total=0 |
-| merge-suggestions/failures | total=0（无未解决失败账本行） |
-| background/logs | 当前 lines 为空 |
+| merge-suggestions/failures | total=0（无未解决技术失败） |
+| background/logs | 见上 3 行 |
 
-**零推荐解释（当前）：**
+**零推荐解释（续验后，可成立）：**
 
-1. pending=0 与 UI/API 一致，不是接口错误。  
-2. 合并任务未被用户暂停（`paused=false`），但部署后 `last_run_at` 仍为 `2026-09-15T00:20:06+08:00`，**尚未出现新的自然巡检完成点**。  
-3. ANN `ready=false`、`rebuild_requested=true`、`last_build_status=never`；日志多次 `ann rebuild skipped (coordinator: iowait_high)`，同时 EventClustering 因 `iowait_high` / foreground load 让步——后台准入在压资源时会跳过合并切片。  
-4. 因此：当前零 pending **不能**解释为“已完成一轮合并推荐扫描后的正常无候选”；更准确是 **等待 ANN 就绪与合并巡检在 IO 缓和后执行**。failures=0 表示尚无新的技术失败入账，也不是把技术失败当成空结果。
+1. 已发生真实部署后巡检：`last_run_at`、cursor、logs、task 文案均更新，不是“尚未巡检”。  
+2. 本轮处理 100 个目标人物，`processed_pairs=0` → **正常无新候选对**，pending 保持 0 与 stats/列表一致。  
+3. failures=0：本轮无技术失败入账；不是把失败伪装成空结果。  
+4. `paused=false`，未清用户暂停、未手工灌推荐、未降阈值。  
+5. dirty 画像仍约 1.5k 属历史积压，不要求本轮清空。
 
-### 6.3 至少一轮后台处理观察
-
-| 窗口 | 约 20:43–20:54（UTC+8），部署后 |
-| --- | --- |
-| 已观察到 | 多轮 `identity profile coordinator slice`；单轮成功构建 10 人；failed 画像数下降 |
-| 未观察到 | ANN 首次成功重建；合并推荐 `last_run_at` 更新；background/logs 新行 |
-
-进度判定：`progress=true`，原因 `identity_slice,dirty_count`。  
-不要求清空全部历史 dirty。
-
-私有制品（脱敏 API/观测 JSON、日志摘录）：  
-`/volume1/docker/relive/backup/deploy-artifacts-20260915-6413beef/prod-acceptance/`  
-本地镜像：`/tmp/relive-deploy-20260915-6413beef/`
+观测制品：`…/prod-acceptance/observe3-{start,end,polls}.json` 与 `observe3-relevant-logs.txt`。
 
 ---
 
@@ -210,11 +216,9 @@
 
 ---
 
-## 8. 剩余目标（线上验收未完成项）
+## 8. 剩余说明（非门禁阻塞）
 
-1. 等待 IO 缓和后 ANN `ready=true`（或出现成功 `last_build_status`）。  
-2. 观察到至少一次合并推荐自然巡检：`people.merge_suggestions.state.last_run_at` 更新，并核对 task/logs/failures/pending 与页面一致。  
-3. 若 ANN 就绪后仍长期无巡检，再单独排查准入/cooldown，**不要**为验收清暂停或手工灌推荐。
+线上验收门禁已通过。后续自然运行仍可继续消化 dirty 积压与后续巡检游标；无需为验收再干预。部署业务 SHA 保持 `6413beef…`；本文档更新为独立 docs 提交。
 
 ---
 
