@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -44,12 +45,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	maxCand := fs.Int("max-candidates", 200, "ANN person-candidate union cap (production default 200)")
 	annK := fs.Int("ann-k", 50, "Per-center ANN Search K (production default 50)")
 	exactK := fs.Int("exact-k", -2, "Per-center exact cosine boost K; -2=engine default(100), -1=off, >=0 explicit")
+	topK := fs.Int("topk", 50, "Rerank TopK after recall; production service uses 50; pass 20 to reproduce older reports")
 	format := fs.String("format", "json", "Output format: json or text")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *annK <= 0 {
 		fmt.Fprintln(stderr, "error: -ann-k must be > 0")
+		return 2
+	}
+	if *topK <= 0 {
+		fmt.Fprintln(stderr, "error: -topk must be > 0")
 		return 2
 	}
 	if strings.TrimSpace(*dbPath) == "" || strings.TrimSpace(*targets) == "" {
@@ -110,8 +116,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	default:
 		recallExactK = *exactK
 	}
-	fmt.Fprintf(stderr, "scope: targets=%v focus_pairs≈%d ann_k=%d exact_k_flag=%d max_candidates=%d\n",
-		targetIDs, countFocus(focusMap), *annK, *exactK, *maxCand)
+	fmt.Fprintf(stderr, "scope: targets=%v focus_pairs≈%d ann_k=%d exact_k_flag=%d max_candidates=%d topk=%d\n",
+		targetIDs, countFocus(focusMap), *annK, *exactK, *maxCand, *topK)
 	fmt.Fprintf(stderr, "strategy: suggest_threshold=%.4f rescue=%.4f margin=%.4f min_center_faces=%d\n",
 		peopleCfg.MergeSuggestionThreshold, peopleCfg.IdentityProfileRescueThreshold, peopleCfg.IdentityProfileMargin, peopleCfg.IdentityProfileMinCenterFaces)
 	fmt.Fprintf(stderr, "cost: rebuild ANN from all active centers for chosen model; memory scales with center count\n")
@@ -169,8 +175,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 			ANNK:          *annK,
 			ExactK:        recallExactK,
 			MaxCandidates: *maxCand,
-			TopK:          20,
+			TopK:          *topK,
 		},
+		FailureRepo: repository.NewPersonMergeSuggestionFailureRepository(db),
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error: diagnose: %v\n", err)
@@ -205,10 +212,11 @@ Usage:
     -focus '265250:265274,285426,382656;267444:272927' \
     [-config /path/to/config.prod.yaml] [-threshold 0.55] \
     [-rescue-threshold 0.65] [-margin 0.05] [-min-center-faces 3] \
-    [-ann-k 50] [-exact-k -2] [-max-candidates 200] [-format json|text]
+    [-ann-k 50] [-exact-k -2] [-max-candidates 200] [-topk 50] [-format json|text]
 
 Opens the DB read-only, rebuilds ANN from active centers on the copy, runs the
 production matching engine for the listed targets only, and prints stage stats.
+-topk defaults to 50 (production); use -topk 20 to reproduce older audit reports.
 Prefer -config so rescue/margin/min_center_faces match production.
 Never writes suggestions. Do not point -db at the live production file.`)
 }
@@ -338,15 +346,46 @@ func inferEmbeddingModel(db *gorm.DB) (string, error) {
 
 func renderText(r *service.MergeSuggestionDiagnoseReport) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "collected_at=%s engine=%s strategy=%s threshold=%.3f index_gen=%d ready=%v\n",
-		r.CollectedAt.Format(time.RFC3339), r.EngineVersion, r.StrategyVersion, r.SuggestThreshold, r.IndexGeneration, r.IndexReady)
+	fmt.Fprintf(&b, "collected_at=%s engine=%s strategy=%s threshold=%.3f topk=%d ann_k=%d exact_k=%d max_cand=%d index_gen=%d ready=%v\n",
+		r.CollectedAt.Format(time.RFC3339), r.EngineVersion, r.StrategyVersion, r.SuggestThreshold,
+		r.TopK, r.ANNK, r.ExactK, r.MaxCandidates, r.IndexGeneration, r.IndexReady)
 	s := r.StageStats
-	fmt.Fprintf(&b, "stages(targets): eligible=%d ineligible=%d profile_ready=%d profile_unavail=%d index_unavail=%d incomplete=%d all_missing=%d\n",
-		s.EligibleTargets, s.IneligibleTargets, s.ProfileReadyTargets, s.ProfileUnavailableTargets, s.IndexUnavailableTargets, s.IncompleteEvidenceTargets, s.AllEvidenceMissingTargets)
+	fmt.Fprintf(&b, "stages(targets): eligible=%d ineligible=%d profile_ready=%d profile_unavail=%d index_unavail=%d incomplete=%d all_missing=%d missing_cands=%d\n",
+		s.EligibleTargets, s.IneligibleTargets, s.ProfileReadyTargets, s.ProfileUnavailableTargets, s.IndexUnavailableTargets, s.IncompleteEvidenceTargets, s.AllEvidenceMissingTargets, s.MissingCandidateCount)
 	fmt.Fprintf(&b, "stages(pairs): recalled=%d ranked=%d hard=%d below_thr=%d insufficient=%d tech=%d accepted=%d\n",
 		s.RecalledCandidatePairs, s.RankedCandidatePairs, s.HardBlockedPairs, s.BelowSuggestThresholdPairs, s.InsufficientPairs, s.TechUnavailablePairs, s.StrategyAcceptedPairs)
+	fmt.Fprintf(&b, "note: insufficient and below_threshold may overlap; do not sum as a funnel\n")
+	if len(s.PrimaryStageCounts) > 0 {
+		keys := make([]string, 0, len(s.PrimaryStageCounts))
+		for k := range s.PrimaryStageCounts {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Fprint(&b, "primary_stage(targets):")
+		for _, k := range keys {
+			fmt.Fprintf(&b, " %s=%d", k, s.PrimaryStageCounts[k])
+		}
+		fmt.Fprintln(&b)
+	}
 	fmt.Fprintf(&b, "focus: recalled=%d not_recalled=%d exact_accepted=%d exact_rejected=%d\n",
 		s.FocusRecalled, s.FocusNotRecalled, s.FocusExactAccepted, s.FocusExactRejected)
+	if r.TimingSummary != nil {
+		t := r.TimingSummary
+		fmt.Fprintf(&b, "timing(ms avg): profile=%d recall=%d rerank=%d compare=%d total=%d max_total=%d sample_targets=%v\n",
+			t.AvgProfileLoadMs, t.AvgRecallMs, t.AvgRerankMs, t.AvgCompareMs, t.AvgTotalMs, t.MaxTotalMs, t.SampledTargetIDs)
+	}
+	if r.FailureSchedule != nil {
+		f := r.FailureSchedule
+		fmt.Fprintf(&b, "failure_schedule(targets): unresolved=%d retry_wait=%d due=%d deferred=%d exhausted=%d waiting_evidence=%d\n",
+			f.UnresolvedTargets, f.RetryWait, f.RetryDue, f.RetryDeferred, f.RetryExhausted, f.WaitingEvidence)
+	}
+	for _, td := range r.Targets {
+		fmt.Fprintf(&b, "target %d stage=%s recalled=%d ranked=%d missing=%d accepted=%d status=%s reason=%s flags=%v\n",
+			td.TargetID, td.PrimaryStage, td.RecalledCount, td.RankedCount, td.MissingCandidateCount, td.StrategyAcceptedCount, td.EngineStatus, td.BlockReason, td.Flags)
+		if len(td.MissingCandidateIDs) > 0 {
+			fmt.Fprintf(&b, "  missing_person_ids=%v\n", td.MissingCandidateIDs)
+		}
+	}
 	for _, fp := range r.FocusPairs {
 		fmt.Fprintf(&b, "pair %d→%d recalled=%v rank=%d trunc=%v score=%.4f fwd=%.4f rev=%.4f status=%s accept=%v drop=%s reason=%s\n",
 			fp.TargetID, fp.CandidateID, fp.Recalled, fp.RecallRank, fp.TruncatedOut, fp.ExactScore, fp.ForwardScore, fp.ReverseScore, fp.EngineStatus, fp.StrategyAccepted, fp.DropStage, fp.StrategyReason)

@@ -46,12 +46,13 @@ type primaryComponentDecision struct {
 }
 
 const (
-	primaryActionAttach  = "attach"
-	primaryActionCreate  = "create"
-	primaryActionPending = "pending"
-	primaryActionWait    = "wait"
-	primaryActionReject  = "reject"
-	primaryActionFail    = "fail"
+	primaryActionAttach       = "attach"
+	primaryActionCreate       = "create"
+	primaryActionPending      = "pending"
+	primaryActionWait         = "wait"
+	primaryActionWaitEvidence = "wait_evidence"
+	primaryActionReject       = "reject"
+	primaryActionFail         = "fail"
 )
 
 // decidePrimaryComponent 对一个组件调用统一引擎一次并应用自动策略。
@@ -100,11 +101,16 @@ func (s *peopleService) decidePrimaryComponent(component []*model.Face) primaryC
 
 	switch res.Status {
 	case IdentityMatchStatusUnavailable:
-		out.action = primaryActionWait
 		out.reason = res.BlockReason
 		if out.reason == "" {
 			out.reason = identityRejectUnavailable
 		}
+		// 已确认无证据：专用等待路径，不烧 identity_unavailable_count / RetryCount。
+		if res.BlockReason == blockNoUsableEvidence {
+			out.action = primaryActionWaitEvidence
+			return out
+		}
+		out.action = primaryActionWait
 		return out
 	case IdentityMatchStatusInvalid:
 		out.action = primaryActionFail
@@ -205,6 +211,9 @@ func (s *peopleService) applyPrimaryComponentDecision(
 	case primaryActionWait:
 		return s.markComponentPendingWithReason(component, nonNegativeScore(decision.score), decision.reason, true)
 
+	case primaryActionWaitEvidence:
+		return s.markComponentWaitingEvidence(component, nonNegativeScore(decision.score), decision.reason)
+
 	case primaryActionFail:
 		return s.markComponentIdentityFailed(component, decision.reason)
 
@@ -247,6 +256,31 @@ func (s *peopleService) markComponentPendingWithReason(component []*model.Face, 
 				fields["retry_count"] = face.RetryCount + 1
 				fields["identity_unavailable_count"] = 0
 				fields["identity_retry_after"] = nil
+			}
+			if err := s.faceRepo.UpdateFields(face.ID, fields); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// markComponentWaitingEvidence 记录「等待更多有效证据」：不增加 RetryCount，
+// 也不增加 identity_unavailable_count（二者分别对应语义未匹配与技术故障）。
+func (s *peopleService) markComponentWaitingEvidence(component []*model.Face, score float64, reason string) error {
+	now := time.Now()
+	return s.executeWrite(func() error {
+		for _, face := range component {
+			if face == nil || face.ID == 0 {
+				continue
+			}
+			fields := map[string]interface{}{
+				"cluster_status":             model.FaceClusterStatusPending,
+				"cluster_score":              score,
+				"clustered_at":               now,
+				"identity_failure_reason":    reason,
+				"identity_unavailable_count": 0,
+				"identity_retry_after":       now.Add(24 * time.Hour),
 			}
 			if err := s.faceRepo.UpdateFields(face.ID, fields); err != nil {
 				return err

@@ -165,6 +165,7 @@ func TestPersonIdentityProfileRepository_ReplaceGenerationActivatesNew(t *testin
 	require.NoError(t, err)
 	assert.Equal(t, 2, got.Profile.ActiveGeneration)
 	assert.Equal(t, model.PersonIdentityProfileStatusReady, got.Profile.Status)
+	assert.Equal(t, model.PersonIdentityBuildOutcomeUsable, got.Profile.BuildOutcome)
 	assert.Len(t, got.Centers, 2)
 	assert.Len(t, got.Members, 3)
 
@@ -259,6 +260,45 @@ func TestPersonIdentityProfileRepository_MarkFailedPreservesGeneration(t *testin
 	assert.Equal(t, 1, got.Profile.ActiveGeneration, "active generation preserved on failure")
 	assert.Equal(t, model.PersonIdentityProfileStatusFailed, got.Profile.Status)
 	assert.Equal(t, "boom", got.Profile.LastError)
+	assert.Empty(t, got.Profile.DirtyReason, "MarkFailed must clear stale dirty_reason")
+}
+
+func TestPersonIdentityProfileRepository_ReplaceGenerationRejectsStaleRevision(t *testing.T) {
+	repo, db := newProfileRepo(t)
+	defer teardownTestDB(db)
+
+	personRepo := NewPersonRepository(db)
+	person := &model.Person{Category: model.PersonCategoryFriend}
+	require.NoError(t, personRepo.Create(person))
+	require.NoError(t, repo.MarkDirty([]uint{person.ID}, "first"))
+
+	var prof model.PersonIdentityProfile
+	require.NoError(t, db.Where("person_id = ?", person.ID).First(&prof).Error)
+	rev := prof.ChangeRevision
+	require.Greater(t, rev, 0)
+
+	require.NoError(t, repo.MarkDirty([]uint{person.ID}, "faces_moved"))
+	emb := model.EncodeEmbedding([]float32{1, 0, 0})
+	build := &model.PersonIdentityProfileBuild{
+		Profile: &model.PersonIdentityProfile{PersonID: person.ID, AlgorithmVersion: "v1", EmbeddingModel: "emb-v1"},
+		Centers: []*model.PersonIdentityCenter{{
+			PersonID: person.ID, Ordinal: 1, CentroidEmbedding: emb, SumEmbedding: emb,
+			SupportCount: 2, TotalWeight: 2, SimilarityP10: 0.9, SimilarityP50: 0.95,
+		}},
+		Members: []*model.PersonIdentityCenterMember{
+			{PersonID: person.ID, FaceID: 1, PhotoID: 1, Similarity: 1, Weight: 1, State: model.PersonIdentityMemberStateAccepted, CenterID: uintPtr(1)},
+			{PersonID: person.ID, FaceID: 2, PhotoID: 1, Similarity: 0.95, Weight: 1, State: model.PersonIdentityMemberStateAccepted, CenterID: uintPtr(1)},
+		},
+		RequireChangeRevision:  true,
+		ExpectedChangeRevision: rev,
+	}
+	err := repo.ReplaceGeneration(person.ID, build)
+	require.ErrorIs(t, err, ErrProfileStale)
+
+	require.NoError(t, db.Where("person_id = ?", person.ID).First(&prof).Error)
+	assert.Equal(t, model.PersonIdentityProfileStatusDirty, prof.Status)
+	assert.Equal(t, "faces_moved", prof.DirtyReason)
+	assert.Equal(t, 0, prof.ActiveGeneration)
 }
 
 func TestPersonIdentityProfileRepository_GetActiveEmptyWhenNoProfile(t *testing.T) {
@@ -341,6 +381,48 @@ func TestPersonIdentityProfileRepository_ListAllActiveCentersPrecisionGuard(t *t
 	centers, err = repo.ListAllActiveCenters("nonexistent")
 	require.NoError(t, err)
 	assert.Empty(t, centers)
+}
+
+// TestPersonIdentityProfileRepository_ListAllActiveCenters_ExcludesNonReadyWithOldCenters
+// 覆盖生产缺陷：failed/dirty/building 仍保留旧活动中心时，全量索引不得装入它们。
+func TestPersonIdentityProfileRepository_ListAllActiveCenters_ExcludesNonReadyWithOldCenters(t *testing.T) {
+	repo, db := newProfileRepo(t)
+	defer teardownTestDB(db)
+
+	personRepo := NewPersonRepository(db)
+	readyP := createPerson(t, personRepo)
+	failedP := createPerson(t, personRepo)
+	dirtyP := createPerson(t, personRepo)
+	buildingP := createPerson(t, personRepo)
+
+	seedActiveGeneration(t, repo, readyP.ID)
+	seedActiveGeneration(t, repo, failedP.ID)
+	seedActiveGeneration(t, repo, dirtyP.ID)
+	seedActiveGeneration(t, repo, buildingP.ID)
+
+	require.NoError(t, repo.MarkFailed(failedP.ID, "replace generation: database is locked"))
+	require.NoError(t, repo.MarkDirty([]uint{dirtyP.ID}, "face_added"))
+	upsertProfileRaw(t, db, personRepo, buildingP.ID, "emb-v1", model.PersonIdentityProfileStatusBuilding, 1)
+
+	all, err := repo.ListAllActiveCenters("emb-v1")
+	require.NoError(t, err)
+	require.Len(t, all, 1, "only ready person's active centers may enter the matching index")
+	assert.Equal(t, readyP.ID, all[0].PersonID)
+
+	byID, err := repo.ListActiveCentersByPersonIDs([]uint{readyP.ID, failedP.ID, dirtyP.ID, buildingP.ID}, "emb-v1")
+	require.NoError(t, err)
+	assert.Len(t, byID, 1)
+	assert.Contains(t, byID, readyP.ID)
+	assert.NotContains(t, byID, failedP.ID)
+	assert.NotContains(t, byID, dirtyP.ID)
+	assert.NotContains(t, byID, buildingP.ID)
+
+	failedBuild, err := repo.GetActive(failedP.ID)
+	require.NoError(t, err)
+	require.NotNil(t, failedBuild)
+	assert.Equal(t, model.PersonIdentityProfileStatusFailed, failedBuild.Profile.Status)
+	assert.Greater(t, failedBuild.Profile.ActiveGeneration, 0)
+	require.NotEmpty(t, failedBuild.Centers, "historical failed centers remain for audit, but must not be match-eligible")
 }
 
 // seedActiveGenerationWithModel 与 seedActiveGeneration 相同，但允许指定 embedding_model，
@@ -1217,16 +1299,16 @@ func TestIdentityProfileRepo_HiddenFilteredFromAllActiveCenters(t *testing.T) {
 	// Create ready profiles + active centers for both.
 	for _, p := range []*model.Person{visible, hidden} {
 		profile := &model.PersonIdentityProfile{
-			PersonID:        p.ID,
-			Status:          model.PersonIdentityProfileStatusReady,
+			PersonID:         p.ID,
+			Status:           model.PersonIdentityProfileStatusReady,
 			ActiveGeneration: 1,
-			EmbeddingModel:  "test-model",
+			EmbeddingModel:   "test-model",
 		}
 		require.NoError(t, db.Create(profile).Error)
 		center := &model.PersonIdentityCenter{
-			PersonID:  p.ID,
+			PersonID:   p.ID,
 			Generation: 1,
-			Ordinal:   0,
+			Ordinal:    0,
 		}
 		require.NoError(t, db.Create(center).Error)
 	}
@@ -1254,16 +1336,16 @@ func TestIdentityProfileRepo_HiddenFilteredFromActiveCentersByPersonIDs(t *testi
 
 	for _, p := range []*model.Person{visible, hidden} {
 		profile := &model.PersonIdentityProfile{
-			PersonID:        p.ID,
-			Status:          model.PersonIdentityProfileStatusReady,
+			PersonID:         p.ID,
+			Status:           model.PersonIdentityProfileStatusReady,
 			ActiveGeneration: 1,
-			EmbeddingModel:  "test-model",
+			EmbeddingModel:   "test-model",
 		}
 		require.NoError(t, db.Create(profile).Error)
 		center := &model.PersonIdentityCenter{
-			PersonID:  p.ID,
+			PersonID:   p.ID,
 			Generation: 1,
-			Ordinal:   0,
+			Ordinal:    0,
 		}
 		require.NoError(t, db.Create(center).Error)
 	}
@@ -1274,4 +1356,117 @@ func TestIdentityProfileRepo_HiddenFilteredFromActiveCentersByPersonIDs(t *testi
 	_, hasHidden := centers[hidden.ID]
 	assert.True(t, hasVisible, "visible person centers should be returned")
 	assert.False(t, hasHidden, "hidden person centers should be filtered out")
+}
+
+func seedAssignedFace(t *testing.T, db *gorm.DB, personID, photoID uint) {
+	t.Helper()
+	require.NoError(t, db.Create(&model.Face{
+		PhotoID:       photoID,
+		PersonID:      &personID,
+		Confidence:    0.9,
+		QualityScore:  0.9,
+		ClusterStatus: model.FaceClusterStatusAssigned,
+	}).Error)
+}
+
+func TestPersonIdentityProfileRepository_MarkFailedSchedulesBoundedRecovery(t *testing.T) {
+	repo, db := newProfileRepo(t)
+	defer teardownTestDB(db)
+
+	personRepo := NewPersonRepository(db)
+	person := &model.Person{Category: model.PersonCategoryFriend}
+	require.NoError(t, personRepo.Create(person))
+	seedAssignedFace(t, db, person.ID, 11)
+	seedActiveGeneration(t, repo, person.ID)
+
+	require.NoError(t, repo.MarkFailed(person.ID, "replace generation: database is locked"))
+	var prof model.PersonIdentityProfile
+	require.NoError(t, db.Where("person_id = ?", person.ID).First(&prof).Error)
+	assert.Equal(t, 1, prof.RecoveryAttempts)
+	assert.False(t, prof.RecoveryExhausted)
+	assert.Equal(t, model.PersonIdentityRecoveryClassDBLocked, prof.RecoveryErrorClass)
+	require.NotNil(t, prof.RecoveryNextAt)
+	assert.GreaterOrEqual(t, prof.RecoveryNextAt.Sub(time.Now().UTC()), 290*time.Second)
+
+	for i := 0; i < model.PersonIdentityRecoveryMaxAttempts-1; i++ {
+		require.NoError(t, repo.MarkFailed(person.ID, "replace generation: database is locked"))
+	}
+	require.NoError(t, db.Where("person_id = ?", person.ID).First(&prof).Error)
+	assert.Equal(t, model.PersonIdentityRecoveryMaxAttempts, prof.RecoveryAttempts)
+	assert.True(t, prof.RecoveryExhausted)
+	var nextIsNull bool
+	require.NoError(t, db.Raw(
+		"SELECT recovery_next_at IS NULL FROM person_identity_profiles WHERE person_id = ?",
+		person.ID,
+	).Scan(&nextIsNull).Error)
+	assert.True(t, nextIsNull, "exhausted recovery must clear recovery_next_at in SQLite")
+
+	due, err := repo.ListFailedDueForRecovery(time.Now().UTC().Add(24*time.Hour), 0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, due)
+}
+
+func TestPersonIdentityProfileRepository_AdmitHistoricalFailedIdempotent(t *testing.T) {
+	repo, db := newProfileRepo(t)
+	defer teardownTestDB(db)
+
+	personRepo := NewPersonRepository(db)
+	visible := &model.Person{Category: model.PersonCategoryFriend}
+	hidden := &model.Person{Category: model.PersonCategoryFriend, Hidden: true}
+	noFace := &model.Person{Category: model.PersonCategoryFriend}
+	require.NoError(t, personRepo.Create(visible))
+	require.NoError(t, personRepo.Create(hidden))
+	require.NoError(t, personRepo.Create(noFace))
+	seedAssignedFace(t, db, visible.ID, 21)
+	seedAssignedFace(t, db, hidden.ID, 22)
+
+	now := time.Date(2026, 9, 14, 0, 0, 0, 0, time.UTC)
+	for _, pid := range []uint{visible.ID, hidden.ID, noFace.ID} {
+		require.NoError(t, db.Create(&model.PersonIdentityProfile{
+			PersonID:  pid,
+			Status:    model.PersonIdentityProfileStatusFailed,
+			LastError: "replace generation: database is locked",
+		}).Error)
+	}
+
+	n, err := repo.AdmitHistoricalFailed(now, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	n, err = repo.AdmitHistoricalFailed(now, 10)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "second admit must be idempotent")
+
+	due, err := repo.ListFailedDueForRecovery(now, 0, 10)
+	require.NoError(t, err)
+	require.Len(t, due, 1)
+	assert.Equal(t, visible.ID, due[0].PersonID)
+	assert.Equal(t, model.PersonIdentityProfileStatusFailed, due[0].Status)
+	assert.Equal(t, 0, due[0].RecoveryAttempts)
+
+	dirty, err := repo.ListDirty(0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, dirty)
+}
+
+func TestPersonIdentityProfileRepository_EvidenceDirtyResetsExhaustedBudget(t *testing.T) {
+	repo, db := newProfileRepo(t)
+	defer teardownTestDB(db)
+
+	personRepo := NewPersonRepository(db)
+	person := &model.Person{Category: model.PersonCategoryFriend}
+	require.NoError(t, personRepo.Create(person))
+	seedActiveGeneration(t, repo, person.ID)
+	for i := 0; i < model.PersonIdentityRecoveryMaxAttempts; i++ {
+		require.NoError(t, repo.MarkFailed(person.ID, "boom"))
+	}
+	require.NoError(t, repo.MarkDirty([]uint{person.ID}, "backfill"))
+	var prof model.PersonIdentityProfile
+	require.NoError(t, db.Where("person_id = ?", person.ID).First(&prof).Error)
+	assert.True(t, prof.RecoveryExhausted, "backfill must not refresh recovery budget")
+
+	require.NoError(t, repo.MarkDirty([]uint{person.ID}, string(InvalidationReasonFacesMoved)))
+	require.NoError(t, db.Where("person_id = ?", person.ID).First(&prof).Error)
+	assert.False(t, prof.RecoveryExhausted)
+	assert.Equal(t, 0, prof.RecoveryAttempts)
 }

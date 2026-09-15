@@ -383,3 +383,51 @@ func TestPersonMergeSuggestionRepository_PersistsMatchSourceAndWarning(t *testin
 	assert.Equal(t, model.PersonMergeMatchSourceIdentityProfile, byCand[1102].MatchSource)
 	assert.Equal(t, model.PersonMergeWarningSamePhotoCooccurrence, byCand[1102].Warning)
 }
+
+func TestPersonMergeSuggestionRepository_MarkPendingStaleIfVersionMismatch(t *testing.T) {
+	db := setupTestDB(t)
+	defer teardownTestDB(db)
+	repo := NewPersonMergeSuggestionRepository(db)
+
+	require.NoError(t, repo.ReplacePendingForTarget(1, model.PersonCategoryFamily, []model.PersonMergeSuggestionItem{
+		{CandidatePersonID: 11, SimilarityScore: 0.7, Rank: 1, EngineVersion: "identity-engine-v3", ConfigFingerprint: "fp-old"},
+	}))
+	require.NoError(t, repo.ReplacePendingForTarget(2, model.PersonCategoryFamily, []model.PersonMergeSuggestionItem{
+		{CandidatePersonID: 22, SimilarityScore: 0.7, Rank: 1, EngineVersion: "identity-engine-v4", ConfigFingerprint: "fp-new"},
+	}))
+	require.NoError(t, repo.ReplacePendingForTarget(3, model.PersonCategoryFamily, []model.PersonMergeSuggestionItem{
+		{CandidatePersonID: 33, SimilarityScore: 0.7, Rank: 1},
+	}))
+	require.NoError(t, repo.ReplacePendingForTarget(4, model.PersonCategoryFamily, []model.PersonMergeSuggestionItem{
+		{CandidatePersonID: 44, SimilarityScore: 0.7, Rank: 1, EngineVersion: "identity-engine-v3", ConfigFingerprint: "fp-old"},
+	}))
+	pending4, err := repo.FindPendingByTarget(4)
+	require.NoError(t, err)
+	require.NoError(t, repo.UpdateSuggestionStatus(pending4.ID, model.PersonMergeSuggestionStatusApplied, nil))
+
+	n, err := repo.MarkPendingStaleIfVersionMismatch("identity-engine-v4", "fp-new", model.PersonMergeStaleReasonEngineMismatch)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), n)
+
+	old, err := repo.FindPendingByTarget(1)
+	require.NoError(t, err)
+	require.NotNil(t, old)
+	assert.Equal(t, model.PersonMergeStaleReasonEngineMismatch, old.StaleReason)
+	assert.Equal(t, model.PersonMergeSuggestionStatusPending, old.Status)
+
+	current, err := repo.FindPendingByTarget(2)
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	assert.Empty(t, current.StaleReason)
+
+	legacyEmpty, err := repo.FindPendingByTarget(3)
+	require.NoError(t, err)
+	require.NotNil(t, legacyEmpty)
+	assert.Empty(t, legacyEmpty.StaleReason)
+
+	applied, err := repo.GetByID(pending4.ID)
+	require.NoError(t, err)
+	require.NotNil(t, applied)
+	assert.Equal(t, model.PersonMergeSuggestionStatusApplied, applied.Status)
+	assert.Empty(t, applied.StaleReason)
+}

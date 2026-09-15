@@ -2,6 +2,7 @@ package service
 
 import (
 	"testing"
+	"time"
 
 	"github.com/davidhoo/relive/internal/model"
 	"github.com/davidhoo/relive/internal/repository"
@@ -93,7 +94,7 @@ func TestDiagnoseMergeSuggestionTargets_FourPairFixture(t *testing.T) {
 		Recall: IdentityRecallOptions{
 			ANNK:          50,
 			ExactK:        -1, // 本夹具只验证 ANN+截断丢召回，关闭精确补召
-			MaxCandidates: 2, // 强制截断，制造「精确可过但召回丢失」
+			MaxCandidates: 2,  // 强制截断，制造「精确可过但召回丢失」
 			TopK:          10,
 		},
 	})
@@ -125,6 +126,113 @@ func TestDiagnoseMergeSuggestionTargets_FourPairFixture(t *testing.T) {
 		require.Contains(t, []string{"recall", "recall_truncated"}, pairB.DropStage)
 		require.True(t, pairB.StrategyAccepted, "漏召回不得掩盖精确策略仍接受")
 	}
+	require.Equal(t, 10, report.TopK)
+	require.NotNil(t, report.StageStats.PrimaryStageCounts)
+	require.NotNil(t, report.TimingSummary)
+}
+
+func TestDiagnoseMergeSuggestionTargets_MissingCandidateIDsAndPrimaryStage(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+
+	target := createMatcherPerson(t, db)
+	good := createMatcherPerson(t, db)
+	bad := createMatcherPerson(t, db)
+	for _, p := range []*model.Person{target, good, bad} {
+		require.NoError(t, db.Model(p).Updates(map[string]interface{}{
+			"category": model.PersonCategoryFamily, "face_count": 5, "hidden": false,
+		}).Error)
+	}
+	targetCenters := seedActiveProfile(t, db, target.ID, "emb-v1", []centerSpec{
+		{emb: []float32{1, 0, 0}, supportCount: 8, p10: 0.4},
+	})
+	goodCenters := seedActiveProfile(t, db, good.ID, "emb-v1", []centerSpec{
+		{emb: []float32{0.99, 0.01, 0}, supportCount: 8, p10: 0.4},
+	})
+	badCenters := seedActiveProfile(t, db, bad.ID, "emb-v1", []centerSpec{
+		{emb: []float32{0.98, 0.02, 0}, supportCount: 8, p10: 0.4},
+	})
+	ann := buildMatcherANN(t, "emb-v1", append(append(targetCenters, goodCenters...), badCenters...))
+	require.NoError(t, db.Model(&model.PersonIdentityCenter{}).Where("id = ?", badCenters[0].ID).
+		Update("centroid_embedding", []byte{0xff, 0xfe, 0xfd}).Error)
+
+	engine := NewIdentityMatchingEngine(
+		ann,
+		repository.NewPersonIdentityProfileRepository(db),
+		repository.NewFaceRepository(db),
+		repository.NewCannotLinkRepository(db),
+		repository.NewFaceRepository(db),
+		IdentityProfileMatcherConfig{EmbeddingModel: "emb-v1", RescueThreshold: 0.65, Margin: 0.05, MinCenterFaces: 3},
+	)
+	report, err := DiagnoseMergeSuggestionTargets(engine, repository.NewPersonRepository(db), MergeSuggestionDiagnoseRequest{
+		TargetIDs: []uint{target.ID},
+		Strategy: NewIdentitySuggestStrategy(config.PeopleConfig{
+			MergeSuggestionThreshold: 0.55, IdentityProfileMinCenterFaces: 3,
+		}),
+		Recall: IdentityRecallOptions{ANNK: 50, ExactK: -1, MaxCandidates: 200, TopK: 50},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 50, report.TopK)
+	require.Len(t, report.Targets, 1)
+	td := report.Targets[0]
+	require.Contains(t, td.MissingCandidateIDs, bad.ID)
+	require.Greater(t, td.MissingCandidateCount, 0)
+	require.Equal(t, report.StageStats.MissingCandidateCount, td.MissingCandidateCount)
+	require.NotEmpty(t, td.PrimaryStage)
+	require.Equal(t, 1, report.StageStats.PrimaryStageCounts[td.PrimaryStage])
+}
+
+func TestDiagnoseMergeSuggestionTargets_FailureScheduleAndTechFlag(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+	require.NoError(t, db.AutoMigrate(&model.PersonMergeSuggestionFailure{}))
+
+	target := createMatcherPerson(t, db)
+	require.NoError(t, db.Model(target).Updates(map[string]interface{}{
+		"category": model.PersonCategoryFamily, "face_count": 5, "hidden": false,
+	}).Error)
+	centers := seedActiveProfile(t, db, target.ID, "emb-v1", []centerSpec{
+		{emb: []float32{1, 0, 0}, supportCount: 8, p10: 0.4},
+	})
+	ann := buildMatcherANN(t, "emb-v1", centers)
+	engine := NewIdentityMatchingEngine(
+		ann,
+		repository.NewPersonIdentityProfileRepository(db),
+		repository.NewFaceRepository(db),
+		repository.NewCannotLinkRepository(db),
+		repository.NewFaceRepository(db),
+		IdentityProfileMatcherConfig{EmbeddingModel: "emb-v1", RescueThreshold: 0.65, Margin: 0.05, MinCenterFaces: 3},
+	)
+
+	failRepo := repository.NewPersonMergeSuggestionFailureRepository(db)
+	now := time.Now().UTC()
+	_, err := failRepo.UpsertTechnicalFailure(repository.PersonMergeFailureUpsert{
+		TargetPersonID: target.ID,
+		ReasonCode:     "profile_unavailable",
+		Now:            now,
+	})
+	require.NoError(t, err)
+	// 烧满预算 → exhausted
+	for i := 0; i < 4; i++ {
+		_, err = failRepo.UpsertTechnicalFailure(repository.PersonMergeFailureUpsert{
+			TargetPersonID: target.ID,
+			ReasonCode:     "profile_unavailable",
+			Now:            now.Add(time.Duration(i+1) * time.Minute),
+		})
+		require.NoError(t, err)
+	}
+
+	report, err := DiagnoseMergeSuggestionTargets(engine, repository.NewPersonRepository(db), MergeSuggestionDiagnoseRequest{
+		TargetIDs:   []uint{target.ID},
+		Strategy:    NewIdentitySuggestStrategy(config.PeopleConfig{MergeSuggestionThreshold: 0.55, IdentityProfileMinCenterFaces: 3}),
+		Recall:      IdentityRecallOptions{ANNK: 50, ExactK: -1, MaxCandidates: 200, TopK: 50},
+		FailureRepo: failRepo,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, report.FailureSchedule)
+	require.Equal(t, int64(1), report.FailureSchedule.UnresolvedTargets)
+	require.Equal(t, int64(1), report.FailureSchedule.RetryExhausted)
+	require.Contains(t, report.Notes, "实际写入/未改变看任务页 API（pending/last_run），本诊断不写库故不含该指标。")
 }
 
 func TestMarkPendingStaleReason_RetryExhausted(t *testing.T) {
@@ -174,6 +282,38 @@ func TestApplySuggestion_RejectsStaleReason(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "needs revalidation")
 	require.Contains(t, err.Error(), model.PersonMergeStaleReasonRetryExhausted)
+
+	still, err := repos.MergeSuggestion.FindPendingByTarget(target.ID)
+	require.NoError(t, err)
+	require.NotNil(t, still)
+	require.Equal(t, model.PersonMergeSuggestionStatusPending, still.Status)
+}
+
+func TestApplySuggestion_RejectsEngineVersionMismatch(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+	require.NoError(t, db.AutoMigrate(&model.PersonMergeSuggestion{}, &model.PersonMergeSuggestionItem{}, &model.AppConfig{}))
+
+	target := createMatcherPerson(t, db)
+	cand := createMatcherPerson(t, db)
+	require.NoError(t, db.Model(target).Updates(map[string]interface{}{"category": model.PersonCategoryFamily, "face_count": 2, "hidden": false}).Error)
+	require.NoError(t, db.Model(cand).Updates(map[string]interface{}{"category": model.PersonCategoryFamily, "face_count": 2, "hidden": false}).Error)
+
+	repos := repository.NewRepositories(db)
+	svcIface := NewPersonMergeSuggestionService(db, repos.Photo, repos.Face, repos.Person, repos.PeopleJob, repos.CannotLink, repos.MergeSuggestion, NewConfigService(repos.Config), &config.Config{People: config.PeopleConfig{MergeSuggestionThreshold: 0.55}})
+	svc := svcIface.(*personMergeSuggestionService)
+
+	require.NoError(t, repos.MergeSuggestion.ReplacePendingForTarget(target.ID, model.PersonCategoryFamily, []model.PersonMergeSuggestionItem{
+		{CandidatePersonID: cand.ID, SimilarityScore: 0.8, Rank: 1, MatchSource: model.PersonMergeMatchSourceIdentityProfile, EngineVersion: "identity-engine-v3"},
+	}))
+	pending, err := repos.MergeSuggestion.FindPendingByTarget(target.ID)
+	require.NoError(t, err)
+	require.NotNil(t, pending)
+
+	err = svc.ApplySuggestion(pending.ID, []uint{cand.ID})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "needs revalidation")
+	require.Contains(t, err.Error(), model.PersonMergeStaleReasonEngineMismatch)
 
 	still, err := repos.MergeSuggestion.FindPendingByTarget(target.ID)
 	require.NoError(t, err)

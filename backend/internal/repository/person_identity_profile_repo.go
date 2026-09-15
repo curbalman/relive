@@ -1,9 +1,11 @@
 package repository
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/davidhoo/relive/internal/model"
@@ -14,6 +16,10 @@ import (
 // ErrPersonNotFound 由 ReplaceGeneration 在目标人物不存在时返回，
 // 供上层服务区分"人物中途被删除"（应清理派生画像、不计为系统失败）与其他写入错误。
 var ErrPersonNotFound = errors.New("person not found")
+
+// ErrProfileStale 表示构建开始后 profile 已被再次失效（dirty/隐藏等），
+// 不得用过时快照覆盖为 ready。调用方应保持 dirty、不计技术失败、不激活索引。
+var ErrProfileStale = errors.New("identity profile changed during build")
 
 // IdentityProfileInvalidationReason 是身份画像失效的稳定原因标识。
 // 不接受任意业务文本作为 reason，避免脏数据落库与隐私泄漏。
@@ -75,28 +81,33 @@ type PersonIdentityProfileRepository interface {
 	// 的 profile，按 person_id ASC，严格应用 limit。reasons 为空时不按 reason 过滤
 	// （等价于 ListDirty）。用于协调器高/低优先级分批拉取，避免全量加载后内存排序。
 	ListDirtyByReasons(reasons []string, cursor uint, limit int) ([]*model.PersonIdentityProfile, error)
+	// ListFailedDueForRecovery 返回未隐藏、仍有脸、未耗尽且已到点的 failed 画像。
+	// 不改 status，供协调器在 dirty 批次剩余名额中构建恢复。
+	ListFailedDueForRecovery(now time.Time, cursor uint, limit int) ([]*model.PersonIdentityProfile, error)
+	// AdmitHistoricalFailed 把缺少 recovery_next_at 的历史 failed 幂等接入调度（不改 status、不重置 attempts）。
+	AdmitHistoricalFailed(now time.Time, limit int) (int, error)
+	// AdmitUnclassifiedEmptyProfiles 把 ready + build_outcome 空 + 无活动代次中心的未隐藏有脸画像
+	// 有界 MarkDirty 做真实 builder 核验；已 dirty/已分类者不重复安排。
+	AdmitUnclassifiedEmptyProfiles(now time.Time, limit int) (int, error)
 	// GetActive 加载人物活动 generation 的完整构建（profile + centers + members）。
 	// profile 不存在或 active_generation=0 时返回 (nil, nil)。
 	GetActive(personID uint) (*model.PersonIdentityProfileBuild, error)
-	// ListAllActiveCenters 通过 JOIN 一次查询返回所有人物活动 generation 的中心，
-	// 按 person_id ASC, ordinal ASC，不返回历史中心。仅返回满足以下全部条件的中心，
-	// 使完整 snapshot 的输入天然满足 ANN 构建要求（数据库侧过滤，禁止全量加载后 Go 内过滤）：
-	//   - center.generation = profile.active_generation 且 active_generation > 0；
-	//   - profile.embedding_model 等于 embeddingModel（当前服务模型签名）；
-	//   - 对应人物仍存在于 people 表。
+	// ListAllActiveCenters 通过 JOIN 一次查询返回当前可匹配的活动中心，
+	// 按 person_id ASC, ordinal ASC，不返回历史中心。过滤条件与
+	// ListActiveCentersByPersonIDs 完全一致（见 matchEligibleCenterQuery），
+	// 使完整 snapshot 的输入天然满足 ANN 构建与精排读取的同一资格口径
+	// （数据库侧过滤，禁止全量加载后 Go 内过滤）。
 	ListAllActiveCenters(embeddingModel string) ([]*model.PersonIdentityCenter, error)
-	// ListActiveCentersByPersonIDs 批量返回指定人物活动 generation 的中心，避免逐候选
-	// N+1 查询。仅返回满足以下全部条件的中心（数据库侧 JOIN 过滤）：
-	//   - center.generation = profile.active_generation 且 active_generation > 0；
-	//   - profile.status = ready；
-	//   - profile.embedding_model 等于 embeddingModel；
-	//   - 对应人物仍存在于 people 表。
+	// ListActiveCentersByPersonIDs 批量返回指定人物当前可匹配的活动中心，避免逐候选
+	// N+1 查询。过滤条件与 ListAllActiveCenters 完全一致（见 matchEligibleCenterQuery）。
 	// 输入去重并忽略 0；按 SQLite 参数上限分块；空输入直接返回空 map 不访问数据库。
 	// 返回顺序为 person_id ASC, ordinal ASC, center_id ASC。
 	ListActiveCentersByPersonIDs(personIDs []uint, embeddingModel string) (map[uint][]*model.PersonIdentityCenter, error)
 	// ReplaceGeneration 在单事务内写入新 generation（centers + members）并原子激活。
 	// build 中 accepted member 的 CenterID 为所属 center 的 Ordinal（逻辑引用），
 	// 持久化 center 取得真实主键后重映射为真实 ID。任何步骤失败整体回滚。
+	// 若 build.RequireChangeRevision 为 true，提交前核验 change_revision 未变，
+	// 变了则返回 ErrProfileStale 并回滚，不把 status 写成 ready。
 	ReplaceGeneration(personID uint, build *model.PersonIdentityProfileBuild) error
 	// MarkFailed 标记构建失败并记录原因，保留活动 generation、中心与成员。
 	MarkFailed(personID uint, message string) error
@@ -159,20 +170,17 @@ func (r *personIdentityProfileRepository) MarkDirty(personIDs []uint, reason str
 		rows := make([]*model.PersonIdentityProfile, 0, len(chunk))
 		for _, pid := range chunk {
 			rows = append(rows, &model.PersonIdentityProfile{
-				PersonID:    pid,
-				Status:      model.PersonIdentityProfileStatusDirty,
-				DirtyReason: reason,
-				UpdatedAt:   now,
+				PersonID:       pid,
+				Status:         model.PersonIdentityProfileStatusDirty,
+				DirtyReason:    reason,
+				ChangeRevision: 1,
+				UpdatedAt:      now,
 			})
 		}
-		// Upsert on person_id: 仅更新 status/reason/updated_at，绝不触碰 active/next generation。
+		// Upsert on person_id: 仅更新 status/reason/updated_at/change_revision，绝不触碰 active/next generation。
 		if err := r.db.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "person_id"}},
-			DoUpdates: clause.Assignments(map[string]interface{}{
-				"status":       model.PersonIdentityProfileStatusDirty,
-				"dirty_reason": reason,
-				"updated_at":   now,
-			}),
+			Columns:   []clause.Column{{Name: "person_id"}},
+			DoUpdates: clause.Assignments(dirtyStatusAssignments(now, reason)),
 		}).Create(rows).Error; err != nil {
 			return err
 		}
@@ -214,6 +222,127 @@ func (r *personIdentityProfileRepository) ListDirtyByReasons(reasons []string, c
 	return profiles, nil
 }
 
+func dirtyStatusAssignments(now time.Time, reason string) map[string]interface{} {
+	assigns := map[string]interface{}{
+		"status":          model.PersonIdentityProfileStatusDirty,
+		"dirty_reason":    reason,
+		"updated_at":      now,
+		"change_revision": gorm.Expr("change_revision + 1"),
+	}
+	// 新的相关人脸/成员证据可以开启新一轮恢复预算；backfill 与空 reason 不能无限刷新。
+	if identityEvidenceReasonResetsRecovery(reason) {
+		assigns["recovery_attempts"] = 0
+		assigns["recovery_exhausted"] = false
+		assigns["recovery_next_at"] = sql.NullTime{}
+		assigns["recovery_error_class"] = ""
+	}
+	return assigns
+}
+
+func identityEvidenceReasonResetsRecovery(reason string) bool {
+	switch IdentityProfileInvalidationReason(reason) {
+	case InvalidationReasonDetectionReplaced,
+		InvalidationReasonPeopleMerged,
+		InvalidationReasonPersonSplit,
+		InvalidationReasonFacesMoved,
+		InvalidationReasonPersonDissolved,
+		InvalidationReasonClusteringAssign,
+		InvalidationReasonReclusterAssign,
+		InvalidationReasonRescueAttach:
+		return true
+	default:
+		return reason == "manual_merge_failure_retry"
+	}
+}
+
+func recoveryEligibleFailedQuery(db *gorm.DB) *gorm.DB {
+	return db.Model(&model.PersonIdentityProfile{}).
+		Joins("INNER JOIN people ON people.id = person_identity_profiles.person_id").
+		Where("person_identity_profiles.status = ?", model.PersonIdentityProfileStatusFailed).
+		Where("people.hidden = ?", false).
+		Where("EXISTS (SELECT 1 FROM faces WHERE faces.person_id = person_identity_profiles.person_id)")
+}
+
+func (r *personIdentityProfileRepository) ListFailedDueForRecovery(now time.Time, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
+	var profiles []*model.PersonIdentityProfile
+	q := recoveryEligibleFailedQuery(r.db).
+		Select("person_identity_profiles.*").
+		Where("person_identity_profiles.recovery_exhausted = ?", false).
+		Where("person_identity_profiles.person_id > ?", cursor).
+		Where("person_identity_profiles.recovery_next_at IS NULL OR person_identity_profiles.recovery_next_at <= ?", now.UTC()).
+		Order("person_identity_profiles.person_id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	if err := q.Find(&profiles).Error; err != nil {
+		return nil, err
+	}
+	return profiles, nil
+}
+
+func (r *personIdentityProfileRepository) AdmitHistoricalFailed(now time.Time, limit int) (int, error) {
+	q := recoveryEligibleFailedQuery(r.db).
+		Where("person_identity_profiles.recovery_exhausted = ?", false).
+		Where("person_identity_profiles.recovery_next_at IS NULL").
+		Order("person_identity_profiles.person_id ASC")
+	if limit > 0 {
+		q = q.Limit(limit)
+	}
+	var ids []uint
+	if err := q.Pluck("person_identity_profiles.person_id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	ts := now.UTC()
+	if err := r.db.Model(&model.PersonIdentityProfile{}).
+		Where("person_id IN ?", ids).
+		Where("status = ?", model.PersonIdentityProfileStatusFailed).
+		Updates(map[string]interface{}{
+			"recovery_next_at": ts,
+			"updated_at":       ts,
+		}).Error; err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
+const dirtyReasonLegacyEmptyVerify = "legacy_empty_verify"
+
+func (r *personIdentityProfileRepository) AdmitUnclassifiedEmptyProfiles(now time.Time, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+	_ = now
+	var ids []uint
+	q := r.db.Model(&model.PersonIdentityProfile{}).
+		Select("person_identity_profiles.person_id").
+		Joins("INNER JOIN people ON people.id = person_identity_profiles.person_id").
+		Where("person_identity_profiles.status = ?", model.PersonIdentityProfileStatusReady).
+		Where("person_identity_profiles.build_outcome = ?", model.PersonIdentityBuildOutcomeUnclassified).
+		Where("people.hidden = ?", false).
+		Where("EXISTS (SELECT 1 FROM faces WHERE faces.person_id = person_identity_profiles.person_id)").
+		Where(`NOT EXISTS (
+			SELECT 1 FROM person_identity_centers c
+			WHERE c.person_id = person_identity_profiles.person_id
+			  AND person_identity_profiles.active_generation > 0
+			  AND c.generation = person_identity_profiles.active_generation
+		)`).
+		Order("person_identity_profiles.person_id ASC").
+		Limit(limit)
+	if err := q.Pluck("person_identity_profiles.person_id", &ids).Error; err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	if err := r.MarkDirty(ids, dirtyReasonLegacyEmptyVerify); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
+}
+
 func (r *personIdentityProfileRepository) GetActive(personID uint) (*model.PersonIdentityProfileBuild, error) {
 	var profile model.PersonIdentityProfile
 	err := r.db.Where("person_id = ?", personID).First(&profile).Error
@@ -246,18 +375,24 @@ func (r *personIdentityProfileRepository) GetActive(personID uint) (*model.Perso
 	}, nil
 }
 
-func (r *personIdentityProfileRepository) ListAllActiveCenters(embeddingModel string) ([]*model.PersonIdentityCenter, error) {
-	var centers []*model.PersonIdentityCenter
-	// JOIN 一次查询：center generation 必须等于 profile active generation 且存在活动 generation；
-	// profile.embedding_model 必须等于当前服务模型签名；对应人物仍存在于 people 表。
-	// 全部条件在数据库侧过滤，避免全量加载后在 Go 内过滤。
-	q := r.db.Table("person_identity_centers AS c").
+// matchEligibleCenterQuery 是当前画像匹配资格的唯一 SQL 口径。
+// 可进入匹配的中心必须同时满足：人物存在且未隐藏；profile 为 ready；
+// 模型签名匹配；active_generation>0；中心 generation 与活动代次一致。
+// 历史 generation 仍保留在表中供审计/回滚，但不会被该查询返回。
+func matchEligibleCenterQuery(db *gorm.DB, embeddingModel string) *gorm.DB {
+	return db.Table("person_identity_centers AS c").
 		Select("c.*").
 		Joins("INNER JOIN person_identity_profiles AS p ON p.person_id = c.person_id").
 		Joins("INNER JOIN people ON people.id = c.person_id").
 		Where("c.generation = p.active_generation AND p.active_generation > 0").
+		Where("p.status = ?", model.PersonIdentityProfileStatusReady).
 		Where("p.embedding_model = ?", embeddingModel).
-		Where("people.hidden = ?", false).
+		Where("people.hidden = ?", false)
+}
+
+func (r *personIdentityProfileRepository) ListAllActiveCenters(embeddingModel string) ([]*model.PersonIdentityCenter, error) {
+	var centers []*model.PersonIdentityCenter
+	q := matchEligibleCenterQuery(r.db, embeddingModel).
 		Order("c.person_id ASC, c.ordinal ASC")
 	if err := q.Find(&centers).Error; err != nil {
 		return nil, err
@@ -265,11 +400,11 @@ func (r *personIdentityProfileRepository) ListAllActiveCenters(embeddingModel st
 	return centers, nil
 }
 
-// ListActiveCentersByPersonIDs 批量返回指定人物活动 generation 的中心，用于 matcher
+// ListActiveCentersByPersonIDs 批量返回指定人物当前可匹配的活动中心，用于 matcher
 // 在 ANN 召回后一次性加载所有候选中心做精确评分，避免逐候选调用 GetActive 产生 N+1。
 //
-// 过滤条件与 ListAllActiveCenters 一致，额外要求 profile.status = ready 并按 person ID
-// 集合限定。输入去重、忽略 0、按 SQLite 参数上限分块；每个分块一次批量查询。
+// 过滤条件与 ListAllActiveCenters 共用 matchEligibleCenterQuery。输入去重、忽略 0、
+// 按 SQLite 参数上限分块；每个分块一次批量查询。
 // 返回 map[personID][]centers，中心按 person_id ASC, ordinal ASC, id ASC 排序。
 // 空输入直接返回空 map，不访问数据库。
 func (r *personIdentityProfileRepository) ListActiveCentersByPersonIDs(personIDs []uint, embeddingModel string) (map[uint][]*model.PersonIdentityCenter, error) {
@@ -280,14 +415,7 @@ func (r *personIdentityProfileRepository) ListActiveCentersByPersonIDs(personIDs
 	}
 	for _, chunk := range chunkIDs(ids) {
 		var centers []*model.PersonIdentityCenter
-		q := r.db.Table("person_identity_centers AS c").
-			Select("c.*").
-			Joins("INNER JOIN person_identity_profiles AS p ON p.person_id = c.person_id").
-			Joins("INNER JOIN people ON people.id = c.person_id").
-			Where("c.generation = p.active_generation AND p.active_generation > 0").
-			Where("p.status = ?", model.PersonIdentityProfileStatusReady).
-			Where("p.embedding_model = ?", embeddingModel).
-			Where("people.hidden = ?", false).
+		q := matchEligibleCenterQuery(r.db, embeddingModel).
 			Where("c.person_id IN ?", chunk).
 			Order("c.person_id ASC, c.ordinal ASC, c.id ASC")
 		if err := q.Find(&centers).Error; err != nil {
@@ -330,6 +458,13 @@ func (r *personIdentityProfileRepository) ReplaceGeneration(personID uint, build
 			}
 		} else if err != nil {
 			return err
+		}
+
+		if person.Hidden {
+			return ErrProfileStale
+		}
+		if build.RequireChangeRevision && profile.ChangeRevision != build.ExpectedChangeRevision {
+			return ErrProfileStale
 		}
 
 		// 3. 分配严格大于活动 generation 的新 generation。next_generation 记录高水位，
@@ -378,17 +513,31 @@ func (r *personIdentityProfileRepository) ReplaceGeneration(personID uint, build
 		//       更新 face-count 快照与算法/embedding 版本、推进 next_generation、记录 built_at。
 		//       在此之前任何失败（含唯一约束冲突）都会回滚，旧 generation 保持激活。
 		now := time.Now().UTC()
+		outcome := model.PersonIdentityBuildOutcomeNoUsableEvidence
+		if len(build.Centers) > 0 {
+			outcome = model.PersonIdentityBuildOutcomeUsable
+		}
+		evidenceVersion := strings.TrimSpace(build.Profile.EvidenceVersion)
+		if evidenceVersion == "" {
+			evidenceVersion = fmt.Sprintf("v1:model=%s:members=%d:centers=%d", build.Profile.EmbeddingModel, len(build.Members), len(build.Centers))
+		}
 		if err := tx.Model(&profile).Updates(map[string]interface{}{
-			"active_generation":   newGen,
-			"next_generation":     newGen + 1,
-			"status":              model.PersonIdentityProfileStatusReady,
-			"dirty_reason":        "",
-			"last_error":          "",
-			"face_count_snapshot": len(build.Members),
-			"algorithm_version":   build.Profile.AlgorithmVersion,
-			"embedding_model":     build.Profile.EmbeddingModel,
-			"built_at":            &now,
-			"updated_at":          now,
+			"active_generation":    newGen,
+			"next_generation":      newGen + 1,
+			"status":               model.PersonIdentityProfileStatusReady,
+			"dirty_reason":         "",
+			"last_error":           "",
+			"face_count_snapshot":  len(build.Members),
+			"algorithm_version":    build.Profile.AlgorithmVersion,
+			"embedding_model":      build.Profile.EmbeddingModel,
+			"built_at":             &now,
+			"updated_at":           now,
+			"build_outcome":        outcome,
+			"evidence_version":     evidenceVersion,
+			"recovery_attempts":    0,
+			"recovery_exhausted":   false,
+			"recovery_next_at":     sql.NullTime{},
+			"recovery_error_class": "",
 		}).Error; err != nil {
 			return err
 		}
@@ -398,13 +547,37 @@ func (r *personIdentityProfileRepository) ReplaceGeneration(personID uint, build
 
 func (r *personIdentityProfileRepository) MarkFailed(personID uint, message string) error {
 	now := time.Now().UTC()
-	return r.db.Model(&model.PersonIdentityProfile{}).
-		Where("person_id = ?", personID).
-		Updates(map[string]interface{}{
-			"status":     model.PersonIdentityProfileStatusFailed,
-			"last_error": message,
-			"updated_at": now,
-		}).Error
+	return r.db.Transaction(func(tx *gorm.DB) error {
+		var profile model.PersonIdentityProfile
+		err := tx.Where("person_id = ?", personID).First(&profile).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		attempts := profile.RecoveryAttempts + 1
+		exhausted := attempts >= model.PersonIdentityRecoveryMaxAttempts
+		class := model.ClassifyIdentityRecoveryError(message)
+		updates := map[string]interface{}{
+			"status":               model.PersonIdentityProfileStatusFailed,
+			"dirty_reason":         "",
+			"last_error":           message,
+			"updated_at":           now,
+			"last_failed_at":       now,
+			"recovery_attempts":    attempts,
+			"recovery_exhausted":   exhausted,
+			"recovery_error_class": class,
+			"change_revision":      gorm.Expr("change_revision + 1"),
+		}
+		if exhausted {
+			updates["recovery_next_at"] = sql.NullTime{Valid: false}
+		} else {
+			next := now.Add(model.IdentityRecoveryBackoff(attempts))
+			updates["recovery_next_at"] = next
+		}
+		return tx.Model(&profile).Updates(updates).Error
+	})
 }
 
 func (r *personIdentityProfileRepository) DeleteByPersonIDs(personIDs []uint) error {
@@ -571,19 +744,16 @@ func (r *personIdentityProfileRepository) ApplyInvalidation(req IdentityProfileI
 				rows := make([]*model.PersonIdentityProfile, 0, len(chunk))
 				for _, pid := range chunk {
 					rows = append(rows, &model.PersonIdentityProfile{
-						PersonID:    pid,
-						Status:      model.PersonIdentityProfileStatusDirty,
-						DirtyReason: reason,
-						UpdatedAt:   now,
+						PersonID:       pid,
+						Status:         model.PersonIdentityProfileStatusDirty,
+						DirtyReason:    reason,
+						ChangeRevision: 1,
+						UpdatedAt:      now,
 					})
 				}
 				if err := tx.Clauses(clause.OnConflict{
-					Columns: []clause.Column{{Name: "person_id"}},
-					DoUpdates: clause.Assignments(map[string]interface{}{
-						"status":       model.PersonIdentityProfileStatusDirty,
-						"dirty_reason": reason,
-						"updated_at":   now,
-					}),
+					Columns:   []clause.Column{{Name: "person_id"}},
+					DoUpdates: clause.Assignments(dirtyStatusAssignments(now, reason)),
 				}).Create(rows).Error; err != nil {
 					return err
 				}

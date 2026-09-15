@@ -114,6 +114,29 @@ export interface PersonMergeSuggestionTask {
   retry_due_count?: number
   retry_deferred_count?: number
   retry_total_count?: number
+  retry_exhausted_count?: number
+  waiting_evidence_count?: number
+  unresolved_target_count?: number
+}
+
+export interface PersonMergeSuggestionFailureItem {
+  target_person_id: number
+  state: 'retry_wait' | 'exhausted' | 'waiting_evidence' | 'resolved' | string
+  reason_code: string
+  attempts: number
+  next_retry_at?: string
+  last_failed_at: string
+  blocking_person_ids?: number[]
+}
+
+export interface PersonMergeFailureRetrySkip {
+  target_person_id: number
+  reason: string
+}
+
+export interface PersonMergeFailureRetryResponse {
+  accepted_target_ids: number[]
+  skipped?: PersonMergeFailureRetrySkip[]
 }
 
 export interface PersonMergeSuggestionStats {

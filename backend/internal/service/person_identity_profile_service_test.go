@@ -68,6 +68,15 @@ func (c *countingIdentityProfileRepo) ListDirtyByReasons(reasons []string, curso
 	c.mu.Unlock()
 	return c.inner.ListDirtyByReasons(reasons, cursor, limit)
 }
+func (c *countingIdentityProfileRepo) ListFailedDueForRecovery(now time.Time, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
+	return c.inner.ListFailedDueForRecovery(now, cursor, limit)
+}
+func (c *countingIdentityProfileRepo) AdmitHistoricalFailed(now time.Time, limit int) (int, error) {
+	return c.inner.AdmitHistoricalFailed(now, limit)
+}
+func (c *countingIdentityProfileRepo) AdmitUnclassifiedEmptyProfiles(now time.Time, limit int) (int, error) {
+	return c.inner.AdmitUnclassifiedEmptyProfiles(now, limit)
+}
 func (c *countingIdentityProfileRepo) ListBackfillPersonIDs(cursor uint, limit int) ([]uint, error) {
 	c.mu.Lock()
 	c.listBackfill++
@@ -599,6 +608,15 @@ func (r *failingReplaceRepo) ListDirty(cursor uint, limit int) ([]*model.PersonI
 func (r *failingReplaceRepo) ListDirtyByReasons(reasons []string, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
 	return r.inner.ListDirtyByReasons(reasons, cursor, limit)
 }
+func (r *failingReplaceRepo) ListFailedDueForRecovery(now time.Time, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
+	return r.inner.ListFailedDueForRecovery(now, cursor, limit)
+}
+func (r *failingReplaceRepo) AdmitHistoricalFailed(now time.Time, limit int) (int, error) {
+	return r.inner.AdmitHistoricalFailed(now, limit)
+}
+func (r *failingReplaceRepo) AdmitUnclassifiedEmptyProfiles(now time.Time, limit int) (int, error) {
+	return r.inner.AdmitUnclassifiedEmptyProfiles(now, limit)
+}
 func (r *failingReplaceRepo) ListBackfillPersonIDs(cursor uint, limit int) ([]uint, error) {
 	return r.inner.ListBackfillPersonIDs(cursor, limit)
 }
@@ -876,6 +894,15 @@ func (r *failingListCentersRepo) ListDirty(cursor uint, limit int) ([]*model.Per
 func (r *failingListCentersRepo) ListDirtyByReasons(reasons []string, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
 	return r.inner.ListDirtyByReasons(reasons, cursor, limit)
 }
+func (r *failingListCentersRepo) ListFailedDueForRecovery(now time.Time, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
+	return r.inner.ListFailedDueForRecovery(now, cursor, limit)
+}
+func (r *failingListCentersRepo) AdmitHistoricalFailed(now time.Time, limit int) (int, error) {
+	return r.inner.AdmitHistoricalFailed(now, limit)
+}
+func (r *failingListCentersRepo) AdmitUnclassifiedEmptyProfiles(now time.Time, limit int) (int, error) {
+	return r.inner.AdmitUnclassifiedEmptyProfiles(now, limit)
+}
 func (r *failingListCentersRepo) ListBackfillPersonIDs(cursor uint, limit int) ([]uint, error) {
 	return r.inner.ListBackfillPersonIDs(cursor, limit)
 }
@@ -1047,6 +1074,15 @@ func (r *failingApplyInvalidationRepo) ListDirty(cursor uint, limit int) ([]*mod
 func (r *failingApplyInvalidationRepo) ListDirtyByReasons(reasons []string, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
 	return r.inner.ListDirtyByReasons(reasons, cursor, limit)
 }
+func (r *failingApplyInvalidationRepo) ListFailedDueForRecovery(now time.Time, cursor uint, limit int) ([]*model.PersonIdentityProfile, error) {
+	return r.inner.ListFailedDueForRecovery(now, cursor, limit)
+}
+func (r *failingApplyInvalidationRepo) AdmitHistoricalFailed(now time.Time, limit int) (int, error) {
+	return r.inner.AdmitHistoricalFailed(now, limit)
+}
+func (r *failingApplyInvalidationRepo) AdmitUnclassifiedEmptyProfiles(now time.Time, limit int) (int, error) {
+	return r.inner.AdmitUnclassifiedEmptyProfiles(now, limit)
+}
 func (r *failingApplyInvalidationRepo) ListBackfillPersonIDs(cursor uint, limit int) ([]uint, error) {
 	return r.inner.ListBackfillPersonIDs(cursor, limit)
 }
@@ -1214,4 +1250,80 @@ func TestPersonIdentityProfileService_ListRecentDecisions_CenterIDsTruncatedTo32
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 	assert.Len(t, out[0].CenterIDs, 32, "CenterIDs truncated to 32")
+}
+
+func TestPersonIdentityProfileService_MarkDirtyImmediatelyDropsFromANN(t *testing.T) {
+	svc, deps := newIdentityProfileServiceForTest(t, "shadow", "emb", 5, 0)
+	person := createPersonWithFaces(t, deps.repos, 100, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "manual"))
+	require.NoError(t, svc.RunBackgroundSlice())
+
+	got, ready := svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	require.True(t, ready)
+	require.Contains(t, got, person.ID)
+
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "face_added"))
+	got, ready = svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	if ready {
+		assert.NotContains(t, got, person.ID, "ready→dirty must drop matching index eligibility immediately")
+	}
+}
+
+func TestPersonIdentityProfileService_MarkFailedImmediatelyDropsFromANN(t *testing.T) {
+	svc, deps := newIdentityProfileServiceForTest(t, "shadow", "emb", 5, 0)
+	person := createPersonWithFaces(t, deps.repos, 100, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "manual"))
+	require.NoError(t, svc.RunBackgroundSlice())
+
+	got, ready := svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	require.True(t, ready)
+	require.Contains(t, got, person.ID)
+
+	svc.markFailed(person.ID, "replace generation: database is locked")
+	active, err := svc.GetActive(person.ID)
+	require.NoError(t, err)
+	require.NotNil(t, active)
+	assert.Equal(t, model.PersonIdentityProfileStatusFailed, active.Profile.Status)
+	assert.Greater(t, active.Profile.ActiveGeneration, 0)
+	require.NotEmpty(t, active.Centers)
+
+	got, ready = svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	if ready {
+		assert.NotContains(t, got, person.ID, "failed historical centers must not stay queryable")
+	}
+}
+
+func TestPersonIdentityProfileService_ActivateAfterFailedDoesNotRestore(t *testing.T) {
+	svc, deps := newIdentityProfileServiceForTest(t, "shadow", "emb", 5, 0)
+	person := createPersonWithFaces(t, deps.repos, 100, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "manual"))
+	require.NoError(t, svc.RunBackgroundSlice())
+
+	require.NoError(t, deps.repos.IdentityProfile.MarkFailed(person.ID, "concurrent fail"))
+	assert.False(t, svc.activateANN(person.ID), "failed profile must not be re-activated into the index")
+
+	got, ready := svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	if ready {
+		assert.NotContains(t, got, person.ID)
+	}
+}
+
+func TestPersonIdentityProfileService_ActivateAfterReadyRebuildsRecall(t *testing.T) {
+	svc, deps := newIdentityProfileServiceForTest(t, "shadow", "emb", 5, 0)
+	person := createPersonWithFaces(t, deps.repos, 100, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "manual"))
+	require.NoError(t, svc.RunBackgroundSlice())
+	svc.markFailed(person.ID, "replace generation: database is locked")
+
+	got, ready := svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	if ready {
+		require.NotContains(t, got, person.ID)
+	}
+
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "retry"))
+	runSliceWithClock(svc, time.Duration(svc.cooldownMs)*time.Millisecond+1)
+
+	got, ready = svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	require.True(t, ready)
+	assert.Contains(t, got, person.ID, "successful rebuild must restore matching eligibility")
 }

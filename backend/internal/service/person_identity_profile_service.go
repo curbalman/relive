@@ -229,6 +229,11 @@ type personIdentityProfileService struct {
 	lastANNBuildDuration  time.Duration
 	lastANNBuildError     string
 	lastANNBuildCenters   int
+
+	// onEvidenceReady 在画像成功提交新 generation 后通知推荐失败表唤醒依赖目标。
+	onEvidenceReady func(personIDs []uint)
+	// onIndexReady 在 ANN 从不可用变为可用后通知推荐侧。
+	onIndexReady func()
 }
 
 // NewPersonIdentityProfileService 构造身份画像服务。
@@ -372,6 +377,30 @@ func (s *personIdentityProfileService) SetBackgroundCoordinator(coord *Backgroun
 	s.coordinator.setBackgroundCoordinator(coord)
 }
 
+// SetEvidenceReadyHook 注入画像成功提交后的推荐唤醒回调。
+func (s *personIdentityProfileService) SetEvidenceReadyHook(fn func(personIDs []uint)) {
+	s.onEvidenceReady = fn
+}
+
+// SetIndexReadyHook 注入 ANN 重建成功后的推荐唤醒回调。
+func (s *personIdentityProfileService) SetIndexReadyHook(fn func()) {
+	s.onIndexReady = fn
+}
+
+func (s *personIdentityProfileService) notifyEvidenceReady(personIDs []uint) {
+	if s.onEvidenceReady == nil || len(personIDs) == 0 {
+		return
+	}
+	s.onEvidenceReady(personIDs)
+}
+
+func (s *personIdentityProfileService) notifyIndexReady() {
+	if s.onIndexReady == nil {
+		return
+	}
+	s.onIndexReady()
+}
+
 // loadAndAlignBackfillState 加载持久化 backfill 状态，并在算法/embedding 版本变化时重置。
 func (s *personIdentityProfileService) loadAndAlignBackfillState() {
 	s.mu.Lock()
@@ -437,6 +466,13 @@ func (s *personIdentityProfileService) ANN() (*identityProfileANN, string) {
 }
 
 // MarkDirty 标记人物画像待重建。
+// 写库成功后立即失效索引资格，使 ready→dirty 的旧中心不能继续被召回；
+// 不删除人工脸、历史中心或人工约束。
+//
+// 顺序是 DB-first，再摘索引：与 Invalidate() 的 ANN-first 不同。精排始终用
+// matchEligibleCenterQuery 复核 DB；陈旧 ANN 召回最多变成 unavailable/IncompleteEvidence
+// 并 RequestRebuild，不会产出错误匹配。若先摘索引而写库失败，人物会从召回里静默消失，
+// 精排无法察觉。因此这里维持写库成功后再失效。
 func (s *personIdentityProfileService) MarkDirty(personIDs []uint, reason string) error {
 	if s.mode == identityProfileModeLegacy {
 		return nil // no-op：不写数据库
@@ -445,9 +481,13 @@ func (s *personIdentityProfileService) MarkDirty(personIDs []uint, reason string
 	if len(ids) == 0 {
 		return nil
 	}
-	return s.executeWrite(func() error {
+	if err := s.executeWrite(func() error {
 		return s.repo.MarkDirty(ids, reason)
-	})
+	}); err != nil {
+		return err
+	}
+	s.invalidateMatchIndex(ids)
+	return nil
 }
 
 // InvalidateANNOnly 仅在内存中失效指定人物的 ANN 中心，不修改 profile 表。
@@ -460,6 +500,61 @@ func (s *personIdentityProfileService) InvalidateANNOnly(personIDs []uint) {
 	for _, pid := range dedupPersonIDs(personIDs) {
 		s.ann.InvalidatePerson(pid)
 	}
+}
+
+// BuildPersonOnce 对单个人物走与协调器相同的 buildOne→ReplaceGeneration 路径并通知证据就绪。
+// 供副本验收/诊断在通用接入队列很长时优先核验对照样本；不手写 build_outcome。
+func (s *personIdentityProfileService) BuildPersonOnce(personID uint) error {
+	if s == nil || personID == 0 || s.coordinator == nil || !s.enabled {
+		return nil
+	}
+	repo := s.bgRepo
+	if repo == nil {
+		repo = s.repo
+	}
+	if repo == nil {
+		return errors.New("identity profile repo unavailable")
+	}
+	db := s.bgDB
+	if db == nil {
+		return errors.New("identity profile db unavailable")
+	}
+	var profile model.PersonIdentityProfile
+	if err := db.Where("person_id = ?", personID).First(&profile).Error; err != nil {
+		return err
+	}
+	res := s.coordinator.buildOne(personID, profile.ChangeRevision)
+	if res.listErr != nil {
+		s.markFailed(personID, truncateMessage("list profile faces: "+res.listErr.Error(), identityProfileErrMsgMax))
+		return res.listErr
+	}
+	if res.err != nil {
+		s.markFailed(personID, truncateMessage(res.err.Error(), identityProfileErrMsgMax))
+		return res.err
+	}
+	if res.deleted || res.build == nil {
+		return nil
+	}
+	writeErr := s.executeWrite(func() error {
+		return repo.ReplaceGeneration(personID, res.build)
+	})
+	if writeErr != nil {
+		if errors.Is(writeErr, repository.ErrPersonNotFound) {
+			s.cleanupDeletedPerson(personID)
+			return nil
+		}
+		if errors.Is(writeErr, repository.ErrProfileStale) {
+			return writeErr
+		}
+		s.markFailed(personID, truncateMessage("replace generation: "+writeErr.Error(), identityProfileErrMsgMax))
+		return writeErr
+	}
+	_ = s.executeWrite(func() error {
+		return repo.DeleteInactiveGenerations(personID, 1)
+	})
+	s.coordinator.applyAnnMerge([]uint{personID}, s.nowFn())
+	s.notifyEvidenceReady([]uint{personID})
+	return nil
 }
 
 // RunBackgroundSlice 执行一次有界后台工作。
@@ -504,8 +599,21 @@ func (s *personIdentityProfileService) rebuildANNFromCoordinator() {
 	s.rebuildANNIfNeeded()
 }
 
-// rebuildANNIfNeeded 在 rebuildRequested 时从活动中心重建 ANN snapshot。
-// 使用专用后台仓库查询，仅返回当前模型签名的活动中心。重建失败只标记不可用并请求重试，
+// RebuildANNForVerify 供 relive-identity-recovery-verify 在跳过耗时切片后，
+// 同步触发一次 ANN 重建，使 BuildIdentityMatchingEngineFromProfileService 能取到
+// 就绪快照。不暴露 embedding 或索引内容；行为与协调器切片中的 rebuild 完全一致。
+// 仅在验收副本 DB 上调用；生产主路径不调用此方法。
+func (s *personIdentityProfileService) RebuildANNForVerify() {
+	if s.ann != nil && !s.ann.RebuildRequested() {
+		s.ann.RequestRebuild()
+	}
+	s.rebuildANNIfNeeded()
+}
+
+
+// rebuildANNIfNeeded 在 rebuildRequested 时从当前可匹配中心重建 ANN snapshot。
+// ListAllActiveCenters 与精排读取共用 matchEligibleCenterQuery：failed/dirty/building、
+// 隐藏、删除、模型失配的旧中心不会进入新图。重建失败只标记不可用并请求重试，
 // 不影响画像 generation 与现有聚类。同时记录脱敏构建状态供只读运行状态接口暴露。
 func (s *personIdentityProfileService) rebuildANNIfNeeded() {
 	if s.ann == nil || !s.ann.RebuildRequested() {
@@ -588,6 +696,7 @@ func (s *personIdentityProfileService) recordANNBuildSuccess(start time.Time, ce
 	s.lastANNBuildError = ""
 	s.lastANNBuildCenters = centers
 	s.annStatsMu.Unlock()
+	s.notifyIndexReady()
 }
 
 // recordANNBuildFailure 记录失败耗时与脱敏错误类别（最长 200 字符），不清空上次成功时间。
@@ -657,28 +766,74 @@ func (s *personIdentityProfileService) advanceBackfill(now time.Time) error {
 	return s.persistBackfillState(st)
 }
 
-// activateANN 从数据库读取人物活动 generation 的真实中心并接入 ANN delta。
-// ANN 更新失败只标记 ANN 不可用并请求重建，不回滚已成功激活的数据库 generation。
-func (s *personIdentityProfileService) activateANN(personID uint) {
+// activateANN 仅把当前可匹配的活动中心接入 ANN delta。
+// 资格以 ListActiveCentersByPersonIDs（与全量索引同一 SQL 口径）为准，不使用 GetActive：
+// GetActive 会返回 failed/dirty 的旧活动 generation，不能再激活已失效人物。
+// 激活后再核验一次，防止并发窗口把过时构建写回索引。
+// ANN 更新失败只标记不可用并请求重建，不回滚已成功激活的数据库 generation。
+func (s *personIdentityProfileService) activateANN(personID uint) bool {
+	if s.ann == nil {
+		return false
+	}
+	repo := s.bgRepo
+	if repo == nil {
+		repo = s.repo
+	}
+	if repo == nil {
+		return false
+	}
+	centersByPerson, err := repo.ListActiveCentersByPersonIDs([]uint{personID}, s.embeddingModel)
+	if err != nil {
+		logger.Warnf("Identity profile ANN: list eligible centers for person %d failed: %v", personID, err)
+		s.ann.RequestRebuild()
+		return false
+	}
+	centers := centersByPerson[personID]
+	if len(centers) == 0 {
+		s.ann.InvalidatePerson(personID)
+		return false
+	}
+	generation := centers[0].Generation
+	if err := s.ann.Activate(personID, generation, centers); err != nil {
+		logger.Warnf("Identity profile ANN: activate person %d failed: %v", personID, err)
+		s.ann.RequestRebuild()
+		return false
+	}
+	verified, err := repo.ListActiveCentersByPersonIDs([]uint{personID}, s.embeddingModel)
+	if err != nil {
+		s.ann.InvalidatePerson(personID)
+		s.ann.RequestRebuild()
+		return false
+	}
+	if !matchEligibleActivation(verified[personID], personID, generation) {
+		s.ann.InvalidatePerson(personID)
+		return false
+	}
+	return true
+}
+
+// matchEligibleActivation 确认激活后读回的中心仍属于同一人物与代次。
+func matchEligibleActivation(centers []*model.PersonIdentityCenter, personID uint, generation int) bool {
+	if len(centers) == 0 || personID == 0 || generation <= 0 {
+		return false
+	}
+	for _, c := range centers {
+		if c == nil || c.PersonID != personID || c.Generation != generation {
+			return false
+		}
+	}
+	return true
+}
+
+// invalidateMatchIndex 只失效索引资格，不删除人工脸、历史中心或人工约束。
+func (s *personIdentityProfileService) invalidateMatchIndex(personIDs []uint) {
 	if s.ann == nil {
 		return
 	}
-	build, err := s.bgRepo.GetActive(personID)
-	if err != nil {
-		logger.Warnf("Identity profile ANN: get active for person %d failed: %v", personID, err)
-		s.ann.RequestRebuild()
-		return
-	}
-	if build == nil || build.Profile == nil || build.Profile.ActiveGeneration == 0 {
-		// 无活动 generation（如构建为空）→ 失效该人物的旧中心即可。
-		s.ann.InvalidatePerson(personID)
-		return
-	}
-	if err := s.ann.Activate(personID, build.Profile.ActiveGeneration, build.Centers); err != nil {
-		// delta 更新失败（容量上限或非法中心）：标记不可用并请求完整重建。
-		logger.Warnf("Identity profile ANN: activate person %d failed: %v", personID, err)
-		s.ann.RequestRebuild()
-		return
+	for _, pid := range personIDs {
+		if pid != 0 {
+			s.ann.InvalidatePerson(pid)
+		}
 	}
 }
 
@@ -694,14 +849,17 @@ func (s *personIdentityProfileService) cleanupDeletedPerson(personID uint) {
 	}
 }
 
-// markFailed 记录构建失败原因，截断长度，保留旧 active generation。
+// markFailed 记录构建失败原因，截断长度，保留旧 active generation 供审计。
+// 写库成功后立即失效索引资格，使 failed 人物的历史中心不能继续被召回。
 func (s *personIdentityProfileService) markFailed(personID uint, message string) {
 	msg := truncateMessage(message, identityProfileErrMsgMax)
 	if err := s.executeWrite(func() error {
 		return s.bgRepo.MarkFailed(personID, msg)
 	}); err != nil {
 		logger.Warnf("Identity profile: mark failed for person %d: %v", personID, err)
+		return
 	}
+	s.invalidateMatchIndex([]uint{personID})
 }
 
 // GetActive 读取人物活动 generation 的完整构建。legacy 返回 nil 且不访问 Repository。
@@ -780,7 +938,7 @@ func (s *personIdentityProfileService) GetOperationalStats(decisionRepo reposito
 			Cursor:      stats.BackfillCursor,
 			Completed:   stats.BackfillCompleted,
 		},
-		ANN: s.buildANNStatsResponse(),
+		ANN:         s.buildANNStatsResponse(),
 		Coordinator: s.coordinator.toStatsResponse(),
 		Decisions: model.IdentityDecisionStats{
 			WindowHours: identityProfileDecisionWindowHours,

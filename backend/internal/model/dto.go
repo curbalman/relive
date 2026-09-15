@@ -487,14 +487,48 @@ type PersonMergeSuggestionTask struct {
 	ProcessedPairs int64      `json:"processed_pairs"`
 	StartedAt      *time.Time `json:"started_at,omitempty"`
 	StoppedAt      *time.Time `json:"stopped_at,omitempty"`
-	// Partial 表示本轮未完整成功（有重试/延期/失败目标），前端应显示「部分完成」。
+	// Partial 表示存在未解决目标（与 pending/dirty/idle 无关）。
 	Partial bool `json:"partial,omitempty"`
-	// RetryDueCount 到期待重试目标数（单位：目标）。
+	// RetryDueCount 到期待重试目标数（单位：目标）；与 RetryDeferredCount 互斥。
 	RetryDueCount int `json:"retry_due_count,omitempty"`
 	// RetryDeferredCount 退避中尚未到期的重试目标数。
 	RetryDeferredCount int `json:"retry_deferred_count,omitempty"`
-	// RetryTotalCount 当前仍在预算内的重试目标总数。
+	// RetryTotalCount 当前仍在预算内的技术重试目标总数（不含 exhausted/waiting_evidence）。
 	RetryTotalCount int `json:"retry_total_count,omitempty"`
+	// RetryExhaustedCount 重试已耗尽的未解决目标数。
+	RetryExhaustedCount int `json:"retry_exhausted_count,omitempty"`
+	// WaitingEvidenceCount 等待更多有效证据的目标数。
+	WaitingEvidenceCount int `json:"waiting_evidence_count,omitempty"`
+	// UnresolvedTargetCount 全部未解决目标去重总数。
+	UnresolvedTargetCount int `json:"unresolved_target_count,omitempty"`
+}
+
+// PersonMergeSuggestionFailureItem 是失败列表 API 的一行（不含详情展开前的大字段以外的阻塞 ID）。
+type PersonMergeSuggestionFailureItem struct {
+	TargetPersonID   uint       `json:"target_person_id"`
+	State            string     `json:"state"`
+	ReasonCode       string     `json:"reason_code"`
+	Attempts         int        `json:"attempts"`
+	NextRetryAt      *time.Time `json:"next_retry_at,omitempty"`
+	LastFailedAt     time.Time  `json:"last_failed_at"`
+	BlockingPersonIDs []uint    `json:"blocking_person_ids,omitempty"`
+}
+
+// PersonMergeFailureRetryRequest 人工重试所选未解决目标。
+type PersonMergeFailureRetryRequest struct {
+	TargetIDs []uint `json:"target_ids" binding:"required,min=1,max=100,dive,gt=0"`
+}
+
+// PersonMergeFailureRetrySkip 人工重试跳过项。
+type PersonMergeFailureRetrySkip struct {
+	TargetPersonID uint   `json:"target_person_id"`
+	Reason         string `json:"reason"`
+}
+
+// PersonMergeFailureRetryResponse 人工重试结果。
+type PersonMergeFailureRetryResponse struct {
+	AcceptedTargetIDs []uint                         `json:"accepted_target_ids"`
+	Skipped           []PersonMergeFailureRetrySkip  `json:"skipped,omitempty"`
 }
 
 type PersonMergeSuggestionStatsResponse struct {
@@ -745,34 +779,34 @@ type FaceQualityRescoreRunCreateRequest struct {
 
 // FaceQualityRescoreRunResponse 单个运行的只读视图。
 type FaceQualityRescoreRunResponse struct {
-	ID                     uint       `json:"id"`
-	Mode                   string     `json:"mode"`
-	ApplyMode              string     `json:"apply_mode"`
-	Status                 string     `json:"status"`
-	TargetPhotoCount       int        `json:"target_photo_count"`
-	TargetFaceCount        int        `json:"target_face_count"`
-	ProcessedPhotoCount    int        `json:"processed_photo_count"`
-	ProcessedFaceCount     int        `json:"processed_face_count"`
-	AcceptedCount          int        `json:"accepted_count"`
-	ReviewRequiredCount    int        `json:"review_required_count"`
-	AutoExcludedCount      int        `json:"auto_excluded_count"`
-	RetryableCount         int        `json:"retryable_count"`
-	SupersededManualCount  int        `json:"superseded_manual_count"`
-	LastError              string     `json:"last_error,omitempty"`
-	StartedAt              *time.Time `json:"started_at,omitempty"`
-	CompletedAt            *time.Time `json:"completed_at,omitempty"`
-	RuleVersion            string     `json:"rule_version"`
-	ModelVersion           string     `json:"model_version"`
-	PhotoLimit             int        `json:"photo_limit"`
-	RetryOfRunID           *uint      `json:"retry_of_run_id,omitempty"`
-	CalibrationRunID       *uint      `json:"calibration_run_id,omitempty"`
+	ID                    uint       `json:"id"`
+	Mode                  string     `json:"mode"`
+	ApplyMode             string     `json:"apply_mode"`
+	Status                string     `json:"status"`
+	TargetPhotoCount      int        `json:"target_photo_count"`
+	TargetFaceCount       int        `json:"target_face_count"`
+	ProcessedPhotoCount   int        `json:"processed_photo_count"`
+	ProcessedFaceCount    int        `json:"processed_face_count"`
+	AcceptedCount         int        `json:"accepted_count"`
+	ReviewRequiredCount   int        `json:"review_required_count"`
+	AutoExcludedCount     int        `json:"auto_excluded_count"`
+	RetryableCount        int        `json:"retryable_count"`
+	SupersededManualCount int        `json:"superseded_manual_count"`
+	LastError             string     `json:"last_error,omitempty"`
+	StartedAt             *time.Time `json:"started_at,omitempty"`
+	CompletedAt           *time.Time `json:"completed_at,omitempty"`
+	RuleVersion           string     `json:"rule_version"`
+	ModelVersion          string     `json:"model_version"`
+	PhotoLimit            int        `json:"photo_limit"`
+	RetryOfRunID          *uint      `json:"retry_of_run_id,omitempty"`
+	CalibrationRunID      *uint      `json:"calibration_run_id,omitempty"`
 	// PipelineVersion 证据管线：legacy_v1 / independent_v2。
-	PipelineVersion        string     `json:"pipeline_version"`
+	PipelineVersion string `json:"pipeline_version"`
 	// TargetScope 目标快照范围语义。
-	TargetScope            string     `json:"target_scope"`
-	EligibleForEnforce     bool       `json:"eligible_for_enforce"`
-	CreatedAt              time.Time  `json:"created_at"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	TargetScope        string    `json:"target_scope"`
+	EligibleForEnforce bool      `json:"eligible_for_enforce"`
+	CreatedAt          time.Time `json:"created_at"`
+	UpdatedAt          time.Time `json:"updated_at"`
 }
 
 // FaceQualityRescoreRestoreRequest run 级恢复自动排除请求。

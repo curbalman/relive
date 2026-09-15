@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const (
 	PersonIdentityProfileStatusDirty    = "dirty"
@@ -8,6 +11,53 @@ const (
 	PersonIdentityProfileStatusReady    = "ready"
 	PersonIdentityProfileStatusFailed   = "failed"
 )
+
+const (
+	PersonIdentityBuildOutcomeUnclassified     = ""
+	PersonIdentityBuildOutcomeUsable           = "usable"
+	PersonIdentityBuildOutcomeNoUsableEvidence = "no_usable_evidence"
+)
+
+const (
+	PersonIdentityRecoveryMaxAttempts     = 5
+	PersonIdentityRecoveryBackoffStartSec = 300
+	PersonIdentityRecoveryBackoffCapSec   = 3600
+
+	PersonIdentityRecoveryClassDBLocked   = "db_locked"
+	PersonIdentityRecoveryClassReadFaces  = "read_faces"
+	PersonIdentityRecoveryClassBuildError = "build_error"
+)
+
+// IdentityRecoveryBackoff 返回第 attempt 次实际构建失败后的等待时间。
+// attempt 从 1 起：300s 起步、指数退避、3600s 上限。
+func IdentityRecoveryBackoff(attempt int) time.Duration {
+	if attempt < 1 {
+		attempt = 1
+	}
+	sec := PersonIdentityRecoveryBackoffStartSec
+	for i := 1; i < attempt; i++ {
+		if sec >= PersonIdentityRecoveryBackoffCapSec/2 {
+			return time.Duration(PersonIdentityRecoveryBackoffCapSec) * time.Second
+		}
+		sec *= 2
+	}
+	if sec > PersonIdentityRecoveryBackoffCapSec {
+		sec = PersonIdentityRecoveryBackoffCapSec
+	}
+	return time.Duration(sec) * time.Second
+}
+
+// ClassifyIdentityRecoveryError 把构建失败文案收成稳定类别，不落完整 SQL/路径。
+func ClassifyIdentityRecoveryError(message string) string {
+	m := strings.ToLower(message)
+	if strings.Contains(m, "database is locked") || strings.Contains(m, "sqlite_busy") {
+		return PersonIdentityRecoveryClassDBLocked
+	}
+	if strings.Contains(m, "list profile faces") {
+		return PersonIdentityRecoveryClassReadFaces
+	}
+	return PersonIdentityRecoveryClassBuildError
+}
 
 const (
 	PersonIdentityMemberStateAccepted  = "accepted"
@@ -32,6 +82,18 @@ type PersonIdentityProfile struct {
 	FaceCountSnapshot int        `gorm:"not null;default:0" json:"face_count_snapshot"`
 	LastError         string     `gorm:"type:text" json:"last_error,omitempty"`
 	BuiltAt           *time.Time `json:"built_at,omitempty"`
+	// ChangeRevision 在 MarkDirty / 失效写路径递增，供构建提交乐观并发核验。
+	// 不随 ReplaceGeneration 成功而清零；下一次 dirty 继续累加。
+	ChangeRevision int `gorm:"not null;default:0" json:"change_revision"`
+	// 有界恢复元数据。仅实际构建尝试消耗 RecoveryAttempts；耗尽后不因重启/巡检重置。
+	RecoveryAttempts   int        `gorm:"not null;default:0" json:"recovery_attempts"`
+	RecoveryNextAt     *time.Time `json:"recovery_next_at,omitempty"`
+	RecoveryExhausted  bool       `gorm:"not null;default:false" json:"recovery_exhausted"`
+	RecoveryErrorClass string     `gorm:"type:varchar(50);not null;default:''" json:"recovery_error_class,omitempty"`
+	LastFailedAt       *time.Time `json:"last_failed_at,omitempty"`
+	// BuildOutcome：空串=未分类；usable=有可匹配中心；no_usable_evidence=输入完整但不足以形成中心。
+	BuildOutcome    string `gorm:"type:varchar(32);not null;default:''" json:"build_outcome,omitempty"`
+	EvidenceVersion string `gorm:"type:varchar(64);not null;default:''" json:"evidence_version,omitempty"`
 }
 
 func (PersonIdentityProfile) TableName() string {
@@ -93,6 +155,10 @@ type PersonIdentityProfileBuild struct {
 	Profile *PersonIdentityProfile
 	Centers []*PersonIdentityCenter
 	Members []*PersonIdentityCenterMember
+	// RequireChangeRevision 为 true 时，ReplaceGeneration 必须看到
+	// ExpectedChangeRevision 与库中当前值一致，否则拒绝激活。
+	RequireChangeRevision  bool
+	ExpectedChangeRevision int
 }
 
 // PersonIdentityProfileStats 汇总身份画像的运行状态：各 status 的 profile 计数、

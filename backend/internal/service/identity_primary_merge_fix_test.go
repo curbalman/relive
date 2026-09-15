@@ -9,6 +9,7 @@ import (
 	"github.com/davidhoo/relive/pkg/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/gorm"
 )
 
 func TestIdentityMatchingEngine_MissingTargetProfileIsUnavailable(t *testing.T) {
@@ -101,17 +102,12 @@ func TestPrimaryAssignments_DoesNotEmptyReplaceUnavailableTargets(t *testing.T) 
 	require.Equal(t, int64(1), total)
 	require.Len(t, after, 1)
 	assert.Equal(t, oldID, after[0].ID, "RunBackgroundSlice must not empty-replace unavailable targets")
-	require.NotEmpty(t, svc.state.RetryTargets)
-	found := false
-	for _, e := range svc.state.RetryTargets {
-		if e.TargetID == target.ID {
-			found = true
-			assert.GreaterOrEqual(t, e.Attempts, 1)
-		}
-	}
-	require.True(t, found)
-	// 延期重试已登记；单次 slice 后 Dirty 可能仍为 true（cursor 未扫完），不得误删 pending。
-	require.False(t, svc.state.RetryTargets[0].NextRetryAt.IsZero())
+	failRow, err := svc.failureRepo.GetByTarget(target.ID)
+	require.NoError(t, err)
+	require.NotNil(t, failRow)
+	assert.Equal(t, model.PersonMergeFailureStateRetryWait, failRow.State)
+	assert.GreaterOrEqual(t, failRow.Attempts, 1)
+	require.NotNil(t, failRow.NextRetryAt)
 }
 
 func TestIdentityMatchingEngine_AllCandidateEvidenceMissingIsUnavailable(t *testing.T) {
@@ -319,11 +315,19 @@ func TestListDueRetryTargets_DropsIneligibleIDs(t *testing.T) {
 	deletedID := uint(999001)
 
 	now := time.Now()
-	svc.state.RetryTargets = []mergeSuggestionRetryEntry{
-		{TargetID: alive.ID, Attempts: 1, NextRetryAt: now.Add(-time.Minute)},
-		{TargetID: hidden.ID, Attempts: 1, NextRetryAt: now.Add(-time.Minute)},
-		{TargetID: deletedID, Attempts: 1, NextRetryAt: now.Add(-time.Minute)},
-	}
+	past := now.Add(-10 * time.Minute) // attempts=1 → next=+5m → 仍早于 now，可进 due
+	_, err := svc.failureRepo.UpsertTechnicalFailure(repository.PersonMergeFailureUpsert{
+		TargetPersonID: alive.ID, ReasonCode: "profile_unavailable", EngineVersion: "v5", ConfigFingerprint: "fp", Now: past,
+	})
+	require.NoError(t, err)
+	_, err = svc.failureRepo.UpsertTechnicalFailure(repository.PersonMergeFailureUpsert{
+		TargetPersonID: hidden.ID, ReasonCode: "profile_unavailable", EngineVersion: "v5", ConfigFingerprint: "fp", Now: past,
+	})
+	require.NoError(t, err)
+	_, err = svc.failureRepo.UpsertTechnicalFailure(repository.PersonMergeFailureUpsert{
+		TargetPersonID: deletedID, ReasonCode: "profile_unavailable", EngineVersion: "v5", ConfigFingerprint: "fp", Now: past,
+	})
+	require.NoError(t, err)
 
 	targets, dropped, err := svc.listDueRetryTargets()
 	require.NoError(t, err)
@@ -331,12 +335,10 @@ func TestListDueRetryTargets_DropsIneligibleIDs(t *testing.T) {
 	require.Equal(t, alive.ID, targets[0].ID)
 	require.ElementsMatch(t, []uint{hidden.ID, deletedID}, dropped)
 
-	dropSet := map[uint]struct{}{hidden.ID: {}, deletedID: {}}
-	svc.state.RetryTargets = removeMergeSuggestionRetries(svc.state.RetryTargets, dropSet)
-	due, remaining, _ := classifyMergeSuggestionRetries(svc.state.RetryTargets, now)
-	require.Len(t, due, 1)
-	require.Equal(t, alive.ID, due[0].TargetID)
-	require.Len(t, remaining, 1)
+	require.NoError(t, svc.failureRepo.ResolveIneligible(dropped))
+	dueIDs, dueErr := svc.listDueFailureTargetIDs(now)
+	require.NoError(t, dueErr)
+	require.Equal(t, []uint{alive.ID}, dueIDs)
 	_ = repos
 }
 
@@ -380,7 +382,12 @@ func TestRankPersonCandidates_PartialMissingEvidenceMarksIncomplete(t *testing.T
 func TestPrimaryAssignments_PartialIncompleteEvidenceNotEmptySuccess(t *testing.T) {
 	db := setupMatcherDB(t)
 	defer closeMatcherDB(t, db)
-	require.NoError(t, db.AutoMigrate(&model.PersonMergeSuggestion{}, &model.PersonMergeSuggestionItem{}, &model.AppConfig{}))
+	require.NoError(t, db.AutoMigrate(
+		&model.PersonMergeSuggestion{},
+		&model.PersonMergeSuggestionItem{},
+		&model.PersonMergeSuggestionFailure{},
+		&model.AppConfig{},
+	))
 
 	peopleCfg := config.PeopleConfig{
 		MergeSuggestionThreshold:       0.55,
@@ -425,7 +432,10 @@ func TestPrimaryAssignments_PartialIncompleteEvidenceNotEmptySuccess(t *testing.
 	_, ok := assignments[target.ID]
 	// 低分候选 + 部分证据不可用：不得完整成功空替换；写路径缺 key 时跳过 ReplacePending。
 	require.False(t, ok, "incomplete evidence must omit target from complete assignments")
-	require.NotEmpty(t, svc.state.RetryTargets)
+	failRow, err := svc.failureRepo.GetByTarget(target.ID)
+	require.NoError(t, err)
+	require.NotNil(t, failRow)
+	assert.Equal(t, model.PersonMergeFailureStateRetryWait, failRow.State)
 	after, total, err := repos.MergeSuggestion.ListPending(1, 10)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), total)
@@ -567,4 +577,181 @@ func TestDecidePrimaryComponent_IncompleteEvidenceWaits(t *testing.T) {
 	require.True(t, dec.engineRes.IncompleteEvidence)
 	require.NotZero(t, dec.score, "wait path must keep Best.Score for diagnostics")
 	require.Equal(t, person.ID, dec.personID)
+}
+
+func seedReadyEmptyProfile(t *testing.T, db *gorm.DB, personID uint, embeddingModel, buildOutcome string) {
+	t.Helper()
+	now := time.Now().UTC()
+	require.NoError(t, db.Create(&model.PersonIdentityProfile{
+		PersonID:          personID,
+		Status:            model.PersonIdentityProfileStatusReady,
+		ActiveGeneration:  1,
+		NextGeneration:    2,
+		EmbeddingModel:    embeddingModel,
+		BuildOutcome:      buildOutcome,
+		FaceCountSnapshot: 2,
+		BuiltAt:           &now,
+	}).Error)
+}
+
+func TestIdentityMatchingEngine_ConfirmedNoUsableEvidenceIsNotTechnicalUnavailable(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+
+	target := createMatcherPerson(t, db)
+	cand := createMatcherPerson(t, db)
+	candCenters := seedActiveProfile(t, db, cand.ID, "emb-v1", []centerSpec{
+		{emb: []float32{1, 0, 0}, supportCount: 5, p10: 0.5},
+	})
+	seedReadyEmptyProfile(t, db, target.ID, "emb-v1", model.PersonIdentityBuildOutcomeNoUsableEvidence)
+
+	ann := buildMatcherANN(t, "emb-v1", candCenters)
+	engine := NewIdentityMatchingEngine(
+		ann,
+		repository.NewPersonIdentityProfileRepository(db),
+		repository.NewFaceRepository(db),
+		repository.NewCannotLinkRepository(db),
+		repository.NewFaceRepository(db),
+		matcherCfg(),
+	)
+
+	got := engine.SimilarPeople([]uint{target.ID}, DefaultIdentityRecallOptions())
+	res := got[target.ID]
+	require.Equal(t, IdentityMatchStatusUnavailable, res.Status)
+	require.Equal(t, blockNoUsableEvidence, res.BlockReason)
+	require.NotEqual(t, IdentityMatchStatusNoCandidate, res.Status)
+}
+
+func TestIdentityMatchingEngine_UnclassifiedEmptyReadyStaysTechnicalUnavailable(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+
+	target := createMatcherPerson(t, db)
+	seedReadyEmptyProfile(t, db, target.ID, "emb-v1", model.PersonIdentityBuildOutcomeUnclassified)
+
+	engine := NewIdentityMatchingEngine(
+		nil,
+		repository.NewPersonIdentityProfileRepository(db),
+		repository.NewFaceRepository(db),
+		repository.NewCannotLinkRepository(db),
+		repository.NewFaceRepository(db),
+		matcherCfg(),
+	)
+	got := engine.SimilarPeople([]uint{target.ID}, DefaultIdentityRecallOptions())
+	require.Equal(t, blockProfileUnavailable, got[target.ID].BlockReason)
+}
+
+func TestPrimaryAssignments_NoUsableEvidenceDoesNotBurnRetryBudget(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+	require.NoError(t, db.AutoMigrate(
+		&model.PersonMergeSuggestion{},
+		&model.PersonMergeSuggestionItem{},
+		&model.PersonMergeSuggestionFailure{},
+		&model.AppConfig{},
+	))
+
+	peopleCfg := config.PeopleConfig{
+		MergeSuggestionThreshold:       0.55,
+		IdentityProfileRescueThreshold: 0.65,
+		IdentityProfileMargin:          0.05,
+		IdentityProfileMinCenterFaces:  3,
+		MergeSuggestionBatchSize:       10,
+		IdentityProfileMode:            model.PeopleIdentityModePrimary,
+	}
+	target := createMatcherPerson(t, db)
+	require.NoError(t, db.Model(target).Updates(map[string]interface{}{
+		"category": model.PersonCategoryFamily, "face_count": 2, "hidden": false,
+	}).Error)
+	seedReadyEmptyProfile(t, db, target.ID, "emb-v1", model.PersonIdentityBuildOutcomeNoUsableEvidence)
+
+	repos := repository.NewRepositories(db)
+	configService := NewConfigService(repos.Config)
+	svcIface := NewPersonMergeSuggestionService(db, repos.Photo, repos.Face, repos.Person, repos.PeopleJob, repos.CannotLink, repos.MergeSuggestion, configService, &config.Config{People: peopleCfg})
+	svc := svcIface.(*personMergeSuggestionService)
+	engine := NewIdentityMatchingEngine(
+		newIdentityProfileANN("emb-v1"),
+		repository.NewPersonIdentityProfileRepository(db),
+		repository.NewFaceRepository(db),
+		repository.NewCannotLinkRepository(db),
+		repository.NewFaceRepository(db),
+		IdentityProfileMatcherConfig{EmbeddingModel: "emb-v1", RescueThreshold: 0.65, Margin: 0.05, MinCenterFaces: 3},
+	)
+	svc.SetIdentityMatchingEngine(engine)
+	svc.SetIdentityProfileMode(model.PeopleIdentityModePrimary)
+	svc.SetIdentitySuggestStrategy(NewIdentitySuggestStrategy(peopleCfg))
+
+	require.NoError(t, repos.MergeSuggestion.ReplacePendingForTarget(target.ID, model.PersonCategoryFamily, []model.PersonMergeSuggestionItem{
+		{CandidatePersonID: 99, SimilarityScore: 0.9, Rank: 1, MatchSource: model.PersonMergeMatchSourceIdentityProfile},
+	}))
+	before, total, err := repos.MergeSuggestion.ListPending(1, 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	oldID := before[0].ID
+
+	_, err = svc.failureRepo.UpsertTechnicalFailure(repository.PersonMergeFailureUpsert{
+		TargetPersonID: target.ID,
+		ReasonCode:     blockProfileUnavailable,
+		Now:            time.Now().Add(-time.Minute),
+	})
+	require.NoError(t, err)
+
+	assignments, err := svc.primaryAssignments([]*model.Person{target}, map[uint]map[uint]bool{})
+	require.NoError(t, err)
+	_, ok := assignments[target.ID]
+	require.False(t, ok, "waiting evidence must not be treated as complete empty success")
+	require.Empty(t, svc.state.RetryTargets, "legacy JSON retry_targets must stay empty")
+
+	failRow, err := svc.failureRepo.GetByTarget(target.ID)
+	require.NoError(t, err)
+	require.NotNil(t, failRow)
+	assert.Equal(t, model.PersonMergeFailureStateWaitingEvidence, failRow.State)
+
+	after, total, err := repos.MergeSuggestion.ListPending(1, 10)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), total)
+	require.Equal(t, oldID, after[0].ID, "existing pending must survive waiting_evidence")
+}
+
+func TestDecidePrimaryComponent_NoUsableEvidenceWaitsWithoutTechnicalBudget(t *testing.T) {
+	db := setupMatcherDB(t)
+	defer closeMatcherDB(t, db)
+
+	empty := createMatcherPerson(t, db)
+	seedReadyEmptyProfile(t, db, empty.ID, "emb-v1", model.PersonIdentityBuildOutcomeNoUsableEvidence)
+	// 把空画像塞进 ANN，模拟陈旧索引仍召回确认无证据人物。
+	ann := newIdentityProfileANN("emb-v1")
+	require.NoError(t, ann.Rebuild([]*model.PersonIdentityCenter{{
+		ID: 1, PersonID: empty.ID, Generation: 1, Ordinal: 1,
+		CentroidEmbedding: model.EncodeEmbedding([]float32{1, 0, 0}),
+		SupportCount:      3, SimilarityP10: 0.5,
+	}}, "emb-v1"))
+
+	engine := NewIdentityMatchingEngine(
+		ann,
+		repository.NewPersonIdentityProfileRepository(db),
+		repository.NewFaceRepository(db),
+		repository.NewCannotLinkRepository(db),
+		repository.NewFaceRepository(db),
+		IdentityProfileMatcherConfig{EmbeddingModel: "emb-v1", RescueThreshold: 0.60, Margin: 0.05, MinCenterFaces: 3},
+	)
+	svc := &peopleService{
+		identityMatchingEngine: engine,
+		identityProfileMode:    model.PeopleIdentityModePrimary,
+		identityAutoStrategy: NewIdentityAutoStrategy(config.PeopleConfig{
+			IdentityProfileRescueThreshold: 0.60,
+			IdentityProfileMargin:          0.05,
+			IdentityProfileMinCenterFaces:  3,
+			MergeSuggestionThreshold:       0.55,
+		}),
+		config: &config.Config{People: config.PeopleConfig{
+			IdentityProfileRescueThreshold: 0.60,
+			IdentityProfileMargin:          0.05,
+			IdentityProfileMinCenterFaces:  3,
+		}},
+	}
+	face := makeFace(1, 10, nil, []float32{0.99, 0.01, 0}, 0.9, false, 0)
+	dec := svc.decidePrimaryComponent([]*model.Face{face})
+	require.Equal(t, primaryActionWaitEvidence, dec.action)
+	require.Equal(t, blockNoUsableEvidence, dec.reason)
 }

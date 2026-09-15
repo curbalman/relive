@@ -89,10 +89,15 @@ func (e *IdentityMatchingEngine) MatchComponent(component []*model.Face, opts Id
 
 	var scored []IdentityCandidateResult
 	missingEvidence := 0
+	confirmedNoEvidence := 0
 	for _, cid := range cands {
 		cev, ok := candEvs[cid]
 		if !ok || len(cev.Units) == 0 {
-			missingEvidence++
+			if e.classifyEmptyPersonEvidence(cid) == blockNoUsableEvidence {
+				confirmedNoEvidence++
+			} else {
+				missingEvidence++
+			}
 			continue
 		}
 		scored = append(scored, e.scoreComponentCandidate(ev, cid, cev))
@@ -102,6 +107,10 @@ func (e *IdentityMatchingEngine) MatchComponent(component []*model.Face, opts Id
 			// 召回 ID 与活动中心脱节：请求 ANN 重建，避免永久不可用。
 			e.requestProfileANNRebuild()
 			return newIdentityMatchResult(IdentityMatchStatusUnavailable, blockProfileUnavailable)
+		}
+		if confirmedNoEvidence > 0 {
+			// 禁止用空画像兜底自动归属；等待证据变化，不烧技术重试。
+			return newIdentityMatchResult(IdentityMatchStatusUnavailable, blockNoUsableEvidence)
 		}
 		return newIdentityMatchResult(IdentityMatchStatusNoCandidate, "")
 	}
@@ -284,8 +293,8 @@ func (e *IdentityMatchingEngine) SimilarPeople(personIDs []uint, opts IdentityRe
 	for _, targetID := range targets {
 		ev, ok := evidences[targetID]
 		if !ok || len(ev.Units) == 0 {
-			// 目标无活动中心/画像不可读：技术不可用，禁止伪装成「确实无候选」。
-			out[targetID] = newIdentityMatchResult(IdentityMatchStatusUnavailable, blockProfileUnavailable)
+			// 目标无活动中心：区分已确认无证据 vs 技术不可用，禁止伪装成「确实无候选」。
+			out[targetID] = newIdentityMatchResult(IdentityMatchStatusUnavailable, e.classifyEmptyPersonEvidence(targetID))
 			continue
 		}
 		cands, ok := e.recallPersonCandidates(ev, targetID, opts)
@@ -334,7 +343,13 @@ func (e *IdentityMatchingEngine) ComparePeople(pairs []PersonPair) map[PersonPai
 		left, lok := evidences[pr.TargetID]
 		right, rok := evidences[pr.CandidateID]
 		if !lok || !rok || len(left.Units) == 0 || len(right.Units) == 0 {
-			out[pr] = newIdentityMatchResult(IdentityMatchStatusUnavailable, blockProfileUnavailable)
+			reason := blockProfileUnavailable
+			if !lok || len(left.Units) == 0 {
+				reason = e.classifyEmptyPersonEvidence(pr.TargetID)
+			} else {
+				reason = e.classifyEmptyPersonEvidence(pr.CandidateID)
+			}
+			out[pr] = newIdentityMatchResult(IdentityMatchStatusUnavailable, reason)
 			continue
 		}
 		out[pr] = e.comparePersonPair(pr.TargetID, pr.CandidateID, left, right)
@@ -410,6 +425,9 @@ func (e *IdentityMatchingEngine) loadPersonEvidences(personIDs []uint) (map[uint
 	if e.profileRepo == nil {
 		return nil, IdentityMatchStatusUnavailable, blockProfileUnavailable
 	}
+	// 精排只读当前可匹配中心；与 ANN 全量装入共用同一 SQL 口径。
+	// 索引快照可能落后：召回了但这里读不到，由调用方标 IncompleteEvidence / unavailable，
+	// 不得降级旧算法或按空结果完成。
 	centersByPerson, err := e.profileRepo.ListActiveCentersByPersonIDs(personIDs, e.cfg.EmbeddingModel)
 	if err != nil {
 		return nil, IdentityMatchStatusUnavailable, blockProfileUnavailable
@@ -462,6 +480,30 @@ func (e *IdentityMatchingEngine) loadPersonEvidences(personIDs []uint) (map[uint
 		}
 	}
 	return out, IdentityMatchStatusMatch, ""
+}
+
+// classifyEmptyPersonEvidence 在精排读不到可匹配中心时，区分：
+//   - build_outcome=no_usable_evidence 的 ready 空画像 → 等待证据（不烧技术重试）
+//   - 其他（无 profile、failed/dirty、未分类空 ready、读失败）→ profile_unavailable
+func (e *IdentityMatchingEngine) classifyEmptyPersonEvidence(personID uint) string {
+	if e == nil || personID == 0 {
+		return blockProfileUnavailable
+	}
+	reader, ok := e.profileRepo.(matcherActiveProfileReader)
+	if !ok || reader == nil {
+		return blockProfileUnavailable
+	}
+	build, err := reader.GetActive(personID)
+	if err != nil || build == nil || build.Profile == nil {
+		return blockProfileUnavailable
+	}
+	p := build.Profile
+	if p.Status == model.PersonIdentityProfileStatusReady &&
+		p.BuildOutcome == model.PersonIdentityBuildOutcomeNoUsableEvidence &&
+		len(build.Centers) == 0 {
+		return blockNoUsableEvidence
+	}
+	return blockProfileUnavailable
 }
 
 // personRecallHit 记录 ANN 并集中某人物的召回质量，用于截断排序。
@@ -549,10 +591,17 @@ func (e *IdentityMatchingEngine) rankPersonCandidates(
 ) IdentityMatchResult {
 	var scored []IdentityCandidateResult
 	missingEvidence := 0
+	confirmedNoEvidence := 0
+	var missingIDs []uint
 	for _, cid := range candIDs {
 		cev, ok := candEvs[cid]
 		if !ok || len(cev.Units) == 0 {
-			missingEvidence++
+			if e.classifyEmptyPersonEvidence(cid) == blockNoUsableEvidence {
+				confirmedNoEvidence++
+			} else {
+				missingEvidence++
+				missingIDs = append(missingIDs, cid)
+			}
 			continue
 		}
 		pair := e.comparePersonPair(targetID, cid, targetEv, cev)
@@ -572,10 +621,18 @@ func (e *IdentityMatchingEngine) rankPersonCandidates(
 	}
 
 	if len(scored) == 0 {
-		// 召回了候选但证据全部不可读：技术不可用，禁止伪装成「确实无候选」。
+		// 召回了候选但证据全部不可读：区分技术不可用与已确认空画像。
 		if missingEvidence > 0 {
 			e.requestProfileANNRebuild()
-			return newIdentityMatchResult(IdentityMatchStatusUnavailable, blockProfileUnavailable)
+			out := newIdentityMatchResult(IdentityMatchStatusUnavailable, blockProfileUnavailable)
+			out.IncompleteEvidence = true
+			out.MissingCandidateIDs = missingIDs
+			out.TargetProfileGeneration = targetEv.Generation
+			return out
+		}
+		if confirmedNoEvidence > 0 {
+			// 召回仅剩确认无证据人物：不得空画像兜底，也不烧技术重试。
+			return newIdentityMatchResult(IdentityMatchStatusUnavailable, blockNoUsableEvidence)
 		}
 		return newIdentityMatchResult(IdentityMatchStatusNoCandidate, "")
 	}
@@ -584,6 +641,7 @@ func (e *IdentityMatchingEngine) rankPersonCandidates(
 	result.MarginApplicable = true
 	result.TargetProfileGeneration = targetEv.Generation
 	result.IncompleteEvidence = missingEvidence > 0
+	result.MissingCandidateIDs = missingIDs
 	best := scored[0]
 	result.Best = &best
 	result.Candidates = scored

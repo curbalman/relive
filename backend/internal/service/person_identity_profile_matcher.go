@@ -20,9 +20,12 @@ const (
 
 // 固定 BlockReason 枚举。稳定字符串，不拼接人名、路径、embedding 或错误全文。
 const (
-	blockIndexUnavailable        = "index_unavailable"
-	blockInvalidQuery            = "invalid_query"
-	blockProfileUnavailable      = "profile_unavailable"
+	blockIndexUnavailable   = "index_unavailable"
+	blockInvalidQuery       = "invalid_query"
+	blockProfileUnavailable = "profile_unavailable"
+	// blockNoUsableEvidence：画像构建完整成功但现有输入不足以形成可匹配中心。
+	// 与 profile_unavailable（技术不可用）互斥，禁止进入技术重试预算。
+	blockNoUsableEvidence        = "no_usable_evidence"
 	blockScoreBelowThreshold     = "score_below_threshold"
 	blockMarginTooSmall          = "margin_too_small"
 	blockBelowCenterBoundary     = "below_center_boundary"
@@ -78,9 +81,14 @@ type IdentityProfileMatcher struct {
 	cfg            IdentityProfileMatcherConfig
 }
 
-// matcherProfileRepo 仅消费 matcher 实际需要的画像仓库方法，避免测试实现全部接口。
+// matcherProfileRepo 仅消费 matcher/engine 实际需要的画像仓库方法。
 type matcherProfileRepo interface {
 	ListActiveCentersByPersonIDs(personIDs []uint, embeddingModel string) (map[uint][]*model.PersonIdentityCenter, error)
+}
+
+// matcherActiveProfileReader 可选读取完整活动画像，用于区分「技术不可用」与「已确认无证据」。
+type matcherActiveProfileReader interface {
+	GetActive(personID uint) (*model.PersonIdentityProfileBuild, error)
 }
 
 // matcherFaceRepo 仅消费同照片共现查询方法。

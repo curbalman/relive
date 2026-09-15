@@ -11,6 +11,8 @@ import type {
   PeopleTask,
   Person,
   PersonMergeSuggestion,
+  PersonMergeSuggestionFailureItem,
+  PersonMergeFailureRetryResponse,
   PersonMergeSuggestionStats,
   PersonMergeSuggestionTask,
   PhotoPeopleResponse,
@@ -163,6 +165,16 @@ export const peopleApi = {
 
   rebuildMergeSuggestionTask() {
     return http.post<ApiResponse<void>>('/people/merge-suggestions/background/rebuild')
+  },
+
+  listMergeSuggestionFailures(params?: { page?: number; page_size?: number }) {
+    return http.get<ApiResponse<PagedResponse<PersonMergeSuggestionFailureItem>>>('/people/merge-suggestions/failures', { params })
+  },
+
+  retryMergeSuggestionFailures(targetIds: number[]) {
+    return http.post<ApiResponse<PersonMergeFailureRetryResponse>>('/people/merge-suggestions/failures/retry', {
+      target_ids: targetIds,
+    })
   },
 
   listMergeSuggestions(params?: { page?: number; page_size?: number }) {

@@ -31,9 +31,9 @@ import (
 type identityProfileCoordinator struct {
 	owner *personIdentityProfileService
 
-	workers       int
-	dirtyBatch    int
-	budget        time.Duration
+	workers        int
+	dirtyBatch     int
+	budget         time.Duration
 	annDeltaThresh float64
 
 	// foregroundBusyFn 返回 true 表示前台 People 写操作正在等待或进行中，应让路。
@@ -115,11 +115,11 @@ type identityProfileBuildResult struct {
 
 // ANN rebuild 触发原因（脱敏稳定字符串，不含 ID/路径/SQL）。
 const (
-	annRebuildReasonDeltaFull    = "delta_full"
-	annRebuildReasonDeltaRatio   = "delta_ratio_threshold"
-	annRebuildReasonRequested    = "rebuild_requested"
-	annRebuildReasonBatchLarge   = "batch_large"
-	annRebuildReasonFirstBuild   = "first_build"
+	annRebuildReasonDeltaFull  = "delta_full"
+	annRebuildReasonDeltaRatio = "delta_ratio_threshold"
+	annRebuildReasonRequested  = "rebuild_requested"
+	annRebuildReasonBatchLarge = "batch_large"
+	annRebuildReasonFirstBuild = "first_build"
 )
 
 // newIdentityProfileCoordinator 构造协调器。owner 提供 repo/builder/ann/nowFn 等依赖；
@@ -265,7 +265,9 @@ func (c *identityProfileCoordinator) runSlice() bool {
 		return false
 	}
 
-	// 拉取 dirty 批次（高优先级优先，不足再补低优先级）。
+	c.admitHistoricalFailed(start)
+
+	// 拉取 dirty 批次（高优先级优先，不足再补到期 failed 恢复与低优先级 dirty）。
 	dirty, err := c.selectDirtyBatch()
 	if err != nil {
 		logger.Warnf("identity profile coordinator: list dirty failed err_category=%T", err)
@@ -288,8 +290,12 @@ func (c *identityProfileCoordinator) runSlice() bool {
 	// 串行写入提交。
 	committedIDs := c.commitSerial(results)
 
-	// 批末 ANN 合并调度。
+	// 先激活索引（可查询）再唤醒依赖推荐，避免读到尚未可查询的证据。
 	c.applyAnnMerge(committedIDs, start)
+
+	if len(committedIDs) > 0 && c.owner != nil {
+		c.owner.notifyEvidenceReady(committedIDs)
+	}
 
 	c.recordSliceResult(len(dirty), len(committedIDs))
 	return true
@@ -307,7 +313,7 @@ func (c *identityProfileCoordinator) processPendingAnnRebuild(sliceStart time.Ti
 
 // identityProfileHighPriorityReasons 是前台 People 操作产生的 dirty_reason 白名单，
 // 这些 dirty 视为高优先级优先构建。与 repository 的失效原因白名单保持一致
-//（reset_all_people 走 ResetAll 路径，不落 dirty_reason，故不在此列）。
+// （reset_all_people 走 ResetAll 路径，不落 dirty_reason，故不在此列）。
 var identityProfileHighPriorityReasons = []string{
 	"detection_replaced_faces",
 	"people_merged",
@@ -319,15 +325,38 @@ var identityProfileHighPriorityReasons = []string{
 	"rescue_attach",
 }
 
+func (c *identityProfileCoordinator) admitHistoricalFailed(now time.Time) {
+	if c.owner == nil || c.owner.bgRepo == nil {
+		return
+	}
+	limit := c.dirtyBatch
+	if limit <= 0 {
+		return
+	}
+	if err := c.owner.executeWrite(func() error {
+		_, err := c.owner.bgRepo.AdmitHistoricalFailed(now, limit)
+		return err
+	}); err != nil {
+		logger.Warnf("identity profile coordinator: admit historical failed err_category=%T", err)
+	}
+	if err := c.owner.executeWrite(func() error {
+		_, err := c.owner.bgRepo.AdmitUnclassifiedEmptyProfiles(now, limit)
+		return err
+	}); err != nil {
+		logger.Warnf("identity profile coordinator: admit unclassified empty profiles err_category=%T", err)
+	}
+}
+
 // selectDirtyBatch 拉取一批 dirty 人物，高优先级（前台操作产生）优先。
 //
 // 实现分两次查询，避免单次 ListDirty 仅按 person_id 排序导致高优先级被低优先级挤出的缺陷
-//（当总 dirty > dirtyBatch 且高优先级 person_id 较大时，单次按 person_id 拉取会漏掉高优先级）：
+// （当总 dirty > dirtyBatch 且高优先级 person_id 较大时，单次按 person_id 拉取会漏掉高优先级）：
 //  1. 先按高优先级 reason 过滤拉取（ListDirtyByReasons），填满 limit；
-//  2. 不足时从 cursor=0 重新拉取剩余所有 dirty（不按 reason 过滤），按 person_id ASC，
+//  2. 不足时补到期的 failed 恢复（不改 status=dirty）；
+//  3. 仍不足时从 cursor=0 重新拉取剩余所有 dirty（不按 reason 过滤），按 person_id ASC，
 //     跳过已选的高优先级，补足到 limit。
 //
-// 步骤 2 从 0 重新拉取而非使用游标，因为低优先级人物 person_id 既可能小于也可能大于高优先级，
+// 步骤 3 从 0 重新拉取而非使用游标，因为低优先级人物 person_id 既可能小于也可能大于高优先级，
 // 单一方向游标无法覆盖；多拉取 limit+已选数 后在内存去重，受 dirtyBatch（默认 10）约束规模可控。
 func (c *identityProfileCoordinator) selectDirtyBatch() ([]*model.PersonIdentityProfile, error) {
 	if c.owner == nil || c.owner.bgRepo == nil {
@@ -341,6 +370,29 @@ func (c *identityProfileCoordinator) selectDirtyBatch() ([]*model.PersonIdentity
 		return nil, err
 	}
 	selected := high
+	if len(selected) < limit {
+		recoveries, err := c.owner.bgRepo.ListFailedDueForRecovery(c.now(), 0, limit-len(selected))
+		if err != nil {
+			return nil, err
+		}
+		dup := make(map[uint]struct{}, len(selected))
+		for _, p := range selected {
+			dup[p.PersonID] = struct{}{}
+		}
+		for _, p := range recoveries {
+			if p == nil {
+				continue
+			}
+			if _, ok := dup[p.PersonID]; ok {
+				continue
+			}
+			selected = append(selected, p)
+			dup[p.PersonID] = struct{}{}
+			if len(selected) >= limit {
+				break
+			}
+		}
+	}
 	if len(selected) < limit {
 		// 补足低优先级：从 0 拉取剩余所有 dirty（含已选高优先级），内存去重补足。
 		need := limit - len(selected)
@@ -363,11 +415,11 @@ func (c *identityProfileCoordinator) selectDirtyBatch() ([]*model.PersonIdentity
 			}
 		}
 	}
-	// 稳定排序：高优先级在前，person_id ASC。
+	// 稳定排序：高优先级在前，person_id ASC。failed 恢复视为低于前台 dirty、高于 backfill。
 	sort.SliceStable(selected, func(i, j int) bool {
-		hi, hj := isHighPriorityDirty(selected[i]), isHighPriorityDirty(selected[j])
-		if hi != hj {
-			return hi // 高优先级在前
+		ri, rj := dirtySelectRank(selected[i]), dirtySelectRank(selected[j])
+		if ri != rj {
+			return ri < rj
 		}
 		return selected[i].PersonID < selected[j].PersonID
 	})
@@ -402,6 +454,20 @@ func isHighPriorityDirty(p *model.PersonIdentityProfile) bool {
 	}
 }
 
+// dirtySelectRank 越小越先构建：前台 dirty > failed 恢复 > backfill/空 reason dirty。
+func dirtySelectRank(p *model.PersonIdentityProfile) int {
+	if p == nil {
+		return 9
+	}
+	if p.Status == model.PersonIdentityProfileStatusFailed {
+		return 1
+	}
+	if isHighPriorityDirty(p) {
+		return 0
+	}
+	return 2
+}
+
 // buildConcurrent 并发执行只读+纯计算构建。worker 数受 c.workers 限制。
 // 结果按 person_id ASC 稳定返回。预算用尽后不再派发新 worker，但已派发的允许完成。
 func (c *identityProfileCoordinator) buildConcurrent(dirty []*model.PersonIdentityProfile, sliceStart time.Time) []identityProfileBuildResult {
@@ -409,11 +475,16 @@ func (c *identityProfileCoordinator) buildConcurrent(dirty []*model.PersonIdenti
 		return nil
 	}
 	type job struct {
-		personID uint
+		personID       uint
+		changeRevision int
 	}
 	jobs := make(chan job, len(dirty))
 	for _, p := range dirty {
-		jobs <- job{personID: p.PersonID}
+		rev := 0
+		if p != nil {
+			rev = p.ChangeRevision
+		}
+		jobs <- job{personID: p.PersonID, changeRevision: rev}
 	}
 	close(jobs)
 
@@ -440,7 +511,7 @@ func (c *identityProfileCoordinator) buildConcurrent(dirty []*model.PersonIdenti
 				if !ok {
 					return
 				}
-				res := c.buildOne(j.personID)
+				res := c.buildOne(j.personID, j.changeRevision)
 				resultsMu.Lock()
 				results = append(results, res)
 				resultsMu.Unlock()
@@ -457,7 +528,8 @@ func (c *identityProfileCoordinator) buildConcurrent(dirty []*model.PersonIdenti
 }
 
 // buildOne 执行单个人物的只读+纯计算构建。不写数据库。
-func (c *identityProfileCoordinator) buildOne(personID uint) identityProfileBuildResult {
+// changeRevision 取自派发时的 dirty 行，提交时必须仍一致。
+func (c *identityProfileCoordinator) buildOne(personID uint, changeRevision int) identityProfileBuildResult {
 	start := c.now()
 	res := identityProfileBuildResult{personID: personID}
 
@@ -476,6 +548,11 @@ func (c *identityProfileCoordinator) buildOne(personID uint) identityProfileBuil
 	if builder == nil {
 		builder = c.owner.builder
 	}
+	if builder == nil {
+		res.err = errors.New("identity profile builder unavailable")
+		res.buildDuration = c.now().Sub(start)
+		return res
+	}
 	build, err := builder.Build(personID, faces)
 	if err != nil {
 		// 人物中途被删除通常表现为 builder 无法构建；这里不在此判定删除，
@@ -484,7 +561,13 @@ func (c *identityProfileCoordinator) buildOne(personID uint) identityProfileBuil
 		res.buildDuration = c.now().Sub(start)
 		return res
 	}
+	if build == nil || build.Profile == nil {
+		res.buildDuration = c.now().Sub(start)
+		return res
+	}
 	build.Profile.EmbeddingModel = c.owner.embeddingModel
+	build.RequireChangeRevision = true
+	build.ExpectedChangeRevision = changeRevision
 	res.build = build
 	res.buildDuration = c.now().Sub(start)
 	if d := res.buildDuration.Milliseconds(); d > 0 {
@@ -528,6 +611,11 @@ func (c *identityProfileCoordinator) commitSerial(results []identityProfileBuild
 				c.owner.cleanupDeletedPerson(r.personID)
 				continue
 			}
+			if errors.Is(writeErr, repository.ErrProfileStale) {
+				// 构建期间又被失效：保持 dirty，不 MarkFailed，不激活过时结果。
+				logger.Infof("identity profile coordinator: generation commit skipped stale person")
+				continue
+			}
 			// 写入失败：ReplaceGeneration 已原子回滚，旧 generation 保留。
 			c.owner.markFailed(r.personID, truncateMessage("replace generation: "+writeErr.Error(), identityProfileErrMsgMax))
 			logger.Warnf("identity profile coordinator: generation commit failed err_category=%T", writeErr)
@@ -564,7 +652,7 @@ func (c *identityProfileCoordinator) applyAnnMerge(committedIDs []uint, sliceSta
 		return
 	}
 
-	// 小批量 activate：对每个成功提交的人物，从数据库读取当前活动 generation 中心接入 delta。
+	// 小批量 activate：对每个成功提交的人物，只接入当前可匹配中心。
 	if successCount == 0 {
 		c.recordAnnActivate(0)
 		return
@@ -582,30 +670,12 @@ func (c *identityProfileCoordinator) applyAnnMerge(committedIDs []uint, sliceSta
 	c.maybeRebuildANN(annRebuildReasonDeltaFull)
 }
 
-// activateOne 从数据库读取人物活动 generation 的真实中心并接入 ANN delta。
-// 复用 owner.activateANN 逻辑（保持 fail-closed 语义）。返回是否成功 activate。
+// activateOne 复用 owner.activateANN：只激活当前可匹配中心，提交后再次核验资格。
 func (c *identityProfileCoordinator) activateOne(personID uint) bool {
-	if c.owner == nil || c.owner.ann == nil {
+	if c.owner == nil {
 		return false
 	}
-	ann := c.owner.ann
-	build, err := c.owner.bgRepo.GetActive(personID)
-	if err != nil {
-		logger.Warnf("identity profile coordinator: ann get active err_category=%T", err)
-		ann.RequestRebuild()
-		return false
-	}
-	if build == nil || build.Profile == nil || build.Profile.ActiveGeneration == 0 {
-		ann.InvalidatePerson(personID)
-		return false
-	}
-	if err := ann.Activate(personID, build.Profile.ActiveGeneration, build.Centers); err != nil {
-		logger.Warnf("identity profile coordinator: ann activate err_category=%T", err)
-		// delta 更新失败（容量上限或非法中心）：标记不可用并请求完整重建。
-		ann.RequestRebuild()
-		return false
-	}
-	return true
+	return c.owner.activateANN(personID)
 }
 
 // shouldFullRebuild 决定批末是否触发 full rebuild。
@@ -723,19 +793,19 @@ func (c *identityProfileCoordinator) toStatsResponse() model.IdentityCoordinator
 	}
 	s := c.snapshotStats()
 	return model.IdentityCoordinatorStats{
-		Running:             c.isRunning(),
-		LastSliceStartedAt:  s.lastSliceStartedAt,
-		LastSliceEndedAt:    s.lastSliceEndedAt,
-		LastDirtySelected:   s.lastDirtySelected,
-		LastBuiltSuccess:    s.lastBuiltSuccess,
-		LastBuiltFailed:     s.lastBuiltFailed,
-		LastSkipped:         s.lastSkipped,
-		Workers:             c.workers,
-		LastBuildDurationMs: s.lastBuildDurationMs,
-		MaxBuildDurationMs:  s.maxBuildDurationMs,
-		LastWriteDurationMs: s.lastWriteDurationMs,
-		LastAnnActivated:    s.lastAnnActivated,
-		LastAnnRebuild:      s.lastAnnRebuild,
+		Running:              c.isRunning(),
+		LastSliceStartedAt:   s.lastSliceStartedAt,
+		LastSliceEndedAt:     s.lastSliceEndedAt,
+		LastDirtySelected:    s.lastDirtySelected,
+		LastBuiltSuccess:     s.lastBuiltSuccess,
+		LastBuiltFailed:      s.lastBuiltFailed,
+		LastSkipped:          s.lastSkipped,
+		Workers:              c.workers,
+		LastBuildDurationMs:  s.lastBuildDurationMs,
+		MaxBuildDurationMs:   s.maxBuildDurationMs,
+		LastWriteDurationMs:  s.lastWriteDurationMs,
+		LastAnnActivated:     s.lastAnnActivated,
+		LastAnnRebuild:       s.lastAnnRebuild,
 		LastAnnRebuildReason: s.lastAnnRebuildReason,
 	}
 }

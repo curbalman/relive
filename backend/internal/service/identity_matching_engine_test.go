@@ -153,3 +153,17 @@ func TestIdentityStrategyFingerprint_Stable(t *testing.T) {
 	require.NotEmpty(t, a)
 	require.Equal(t, a, b)
 }
+
+func TestIdentityStrategyFingerprint_IncludesEngineVersion(t *testing.T) {
+	cfg := config.PeopleConfig{
+		IdentityProfileRescueThreshold: 0.65,
+		MergeSuggestionThreshold:       0.55,
+		IdentityProfileMargin:          0.05,
+		IdentityProfileMinCenterFaces:  3,
+		IdentityProfileMinCenterPhotos: 2,
+		IdentityProfileMaxCenters:      6,
+	}
+	fp := IdentityStrategyFingerprint(cfg)
+	require.NotEmpty(t, fp)
+	require.Equal(t, "identity-engine-v5", identityEngineVersion)
+}

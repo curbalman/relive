@@ -18,6 +18,9 @@ type PersonMergeSuggestionRepository interface {
 	FindPendingSuggestionByCandidate(candidatePersonID uint) (*model.PersonMergeSuggestion, error)
 	// MarkPendingStaleReason 给指定目标的 pending 建议写入 stale_reason（保持 pending，标明需重验）。
 	MarkPendingStaleReason(targetPersonIDs []uint, reason string) (int64, error)
+	// MarkPendingStaleIfVersionMismatch 将引擎版本或配置指纹落后于当前值的 pending
+	// 标为需重验。不改 applied/dismissed，不覆盖已有 stale_reason，不复活终态建议。
+	MarkPendingStaleIfVersionMismatch(engineVersion, configFingerprint, reason string) (int64, error)
 }
 
 type personMergeSuggestionRepository struct {
@@ -132,6 +135,29 @@ func (r *personMergeSuggestionRepository) MarkPendingStaleReason(targetPersonIDs
 	res := r.db.Model(&model.PersonMergeSuggestion{}).
 		Where("target_person_id IN ? AND status = ?", targetPersonIDs, model.PersonMergeSuggestionStatusPending).
 		Update("stale_reason", reason)
+	return res.RowsAffected, res.Error
+}
+
+// MarkPendingStaleIfVersionMismatch 只更新仍为 pending 且尚未标记 stale 的行。
+// 仅当已落库的 engine_version / config_fingerprint 非空且与当前值不同时才标记，
+// 避免把尚未写入版本元数据的历史 pending 误伤成全部过期。
+func (r *personMergeSuggestionRepository) MarkPendingStaleIfVersionMismatch(engineVersion, configFingerprint, reason string) (int64, error) {
+	if reason == "" || (engineVersion == "" && configFingerprint == "") {
+		return 0, nil
+	}
+	q := r.db.Model(&model.PersonMergeSuggestion{}).
+		Where("status = ?", model.PersonMergeSuggestionStatusPending).
+		Where("stale_reason = ?", "")
+	switch {
+	case engineVersion != "" && configFingerprint != "":
+		q = q.Where("(engine_version != '' AND engine_version != ?) OR (config_fingerprint != '' AND config_fingerprint != ?)",
+			engineVersion, configFingerprint)
+	case engineVersion != "":
+		q = q.Where("engine_version != '' AND engine_version != ?", engineVersion)
+	default:
+		q = q.Where("config_fingerprint != '' AND config_fingerprint != ?", configFingerprint)
+	}
+	res := q.Update("stale_reason", reason)
 	return res.RowsAffected, res.Error
 }
 

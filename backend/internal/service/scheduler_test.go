@@ -71,6 +71,14 @@ func (s *mergeSuggestionServiceStub) GetPendingByID(id uint) (*model.PersonMerge
 	return nil, nil
 }
 
+func (s *mergeSuggestionServiceStub) ListFailures(page, pageSize int) ([]model.PersonMergeSuggestionFailureItem, int64, error) {
+	return nil, 0, nil
+}
+
+func (s *mergeSuggestionServiceStub) RetryFailures(targetIDs []uint, reason string) (*model.PersonMergeFailureRetryResponse, error) {
+	return &model.PersonMergeFailureRetryResponse{}, nil
+}
+
 func (s *mergeSuggestionServiceStub) AttachThreshold() float64 {
 	return 0.65
 }

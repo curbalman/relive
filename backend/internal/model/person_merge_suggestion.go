@@ -38,6 +38,9 @@ const (
 	// PersonMergeStaleReasonRetryExhausted 表示目标因技术不可用耗尽重试预算，
 	// 历史 pending 证据可能过期，不能无条件接受。
 	PersonMergeStaleReasonRetryExhausted = "retry_exhausted_needs_revalidation"
+	// PersonMergeStaleReasonEngineMismatch 表示待审建议的引擎版本或配置指纹
+	// 已落后于当前匹配资格语义，审核前必须重验；不改变 applied/dismissed。
+	PersonMergeStaleReasonEngineMismatch = "engine_or_config_needs_revalidation"
 )
 
 type PersonMergeSuggestion struct {

@@ -26,6 +26,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 		&model.CannotLinkConstraint{},
 		&model.PersonMergeSuggestion{},
 		&model.PersonMergeSuggestionItem{},
+		&model.PersonMergeSuggestionFailure{},
 		&model.PeopleJob{},
 		&model.AnalysisRuntimeLease{},
 		&model.DisplayRecord{},

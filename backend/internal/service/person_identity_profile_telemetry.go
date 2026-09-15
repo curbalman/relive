@@ -44,6 +44,7 @@ var allowedIdentityDecisionReasons = map[string]struct{}{
 	blockIndexUnavailable:        {},
 	blockInvalidQuery:            {},
 	blockProfileUnavailable:      {},
+	blockNoUsableEvidence:        {},
 	blockScoreBelowThreshold:     {},
 	blockMarginTooSmall:          {},
 	blockBelowCenterBoundary:     {},

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
@@ -196,6 +197,7 @@ func AutoMigrate(db *gorm.DB) error {
 		&model.PeopleMergeJob{},
 		&model.PersonMergeSuggestion{},
 		&model.PersonMergeSuggestionItem{},
+		&model.PersonMergeSuggestionFailure{},
 		&model.ScanJob{},
 		&model.ThumbnailJob{},
 		&model.GeocodeJob{},
@@ -342,6 +344,23 @@ func AutoMigrate(db *gorm.DB) error {
 		return err
 	}
 
+	if err := migrateIdentityProfileRecoveryV1(db); err != nil {
+		return err
+	}
+
+	if err := migrateMergeSuggestionFailuresV1(db); err != nil {
+		return err
+	}
+	if err := migrateMergeSuggestionFailuresV2(db); err != nil {
+		return err
+	}
+	if err := migrateMergeSuggestionFailuresV3(db); err != nil {
+		return err
+	}
+	if err := migrateMergeSuggestionFailuresV4(db); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -446,8 +465,9 @@ func migrateFaceQualityColumns(db *gorm.DB) error {
 // 标记为 historical_backfill/missing，使其从“待人工审核”移入“历史人脸待补证据”。
 //
 // 一次性标记的精确条件（与计划 §3.2 一致，不得用分数/规则版本/时间范围推断）：
-//   is_current=1 AND source='auto' AND decision='review_required'
-//   AND TRIM(COALESCE(evidence_json,''))='' AND evidence_origin=''
+//
+//	is_current=1 AND source='auto' AND decision='review_required'
+//	AND TRIM(COALESCE(evidence_json,''))='' AND evidence_origin=''
 //
 // 幂等：app_config 标记 migration.face_quality_evidence_origin_v1。索引重建为自愈式（DROP IF EXISTS + CREATE）。
 func migrateFaceQualityEvidenceOrigin(db *gorm.DB) error {
@@ -1474,5 +1494,231 @@ END`
 		db.Create(&model.AppConfig{Key: migrationKey, Value: "done"})
 		log.Printf("[database] people identity primary v1 migration complete")
 	}
+	return nil
+}
+
+// migrateIdentityProfileRecoveryV1 为画像增加乐观并发修订号、有界恢复字段与构建结果分类。
+// 幂等补列；新库也可由 AutoMigrate 创建这些列。
+func migrateIdentityProfileRecoveryV1(db *gorm.DB) error {
+	const migrationKey = "migration.identity_profile_recovery_v1"
+
+	var cfg model.AppConfig
+	alreadyMarked := db.Where("key = ?", migrationKey).First(&cfg).Error == nil
+	if !alreadyMarked {
+		log.Printf("[database] migrating identity profile recovery v1 columns...")
+	}
+
+	cols := []struct {
+		name string
+		ddl  string
+	}{
+		{"change_revision", "ALTER TABLE person_identity_profiles ADD COLUMN change_revision INTEGER NOT NULL DEFAULT 0"},
+		{"recovery_attempts", "ALTER TABLE person_identity_profiles ADD COLUMN recovery_attempts INTEGER NOT NULL DEFAULT 0"},
+		{"recovery_next_at", "ALTER TABLE person_identity_profiles ADD COLUMN recovery_next_at DATETIME"},
+		{"recovery_exhausted", "ALTER TABLE person_identity_profiles ADD COLUMN recovery_exhausted INTEGER NOT NULL DEFAULT 0"},
+		{"recovery_error_class", "ALTER TABLE person_identity_profiles ADD COLUMN recovery_error_class VARCHAR(50) NOT NULL DEFAULT ''"},
+		{"last_failed_at", "ALTER TABLE person_identity_profiles ADD COLUMN last_failed_at DATETIME"},
+		{"build_outcome", "ALTER TABLE person_identity_profiles ADD COLUMN build_outcome VARCHAR(32) NOT NULL DEFAULT ''"},
+		{"evidence_version", "ALTER TABLE person_identity_profiles ADD COLUMN evidence_version VARCHAR(64) NOT NULL DEFAULT ''"},
+	}
+	for _, col := range cols {
+		if !db.Migrator().HasColumn(&model.PersonIdentityProfile{}, col.name) {
+			if err := db.Exec(col.ddl).Error; err != nil {
+				return fmt.Errorf("add person_identity_profiles.%s: %w", col.name, err)
+			}
+		}
+	}
+
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_pip_recovery_due ON person_identity_profiles(status, recovery_exhausted, recovery_next_at, person_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pip_build_outcome ON person_identity_profiles(status, build_outcome, person_id)`,
+	}
+	for _, sql := range indexes {
+		if err := db.Exec(sql).Error; err != nil {
+			return fmt.Errorf("create identity profile recovery index: %w", err)
+		}
+	}
+
+	if !alreadyMarked {
+		db.Create(&model.AppConfig{Key: migrationKey, Value: "done"})
+		log.Printf("[database] identity profile recovery v1 migration complete")
+	}
+	return nil
+}
+
+// migrateMergeSuggestionFailuresV1 创建失败表索引，并把旧 app_config.retry_targets 幂等导入后清空。
+func migrateMergeSuggestionFailuresV1(db *gorm.DB) error {
+	const migrationKey = "migration.merge_suggestion_failures_v1"
+
+	var cfg model.AppConfig
+	alreadyMarked := db.Where("key = ?", migrationKey).First(&cfg).Error == nil
+	if alreadyMarked {
+		return nil
+	}
+	log.Printf("[database] migrating merge suggestion failures v1...")
+
+	if !db.Migrator().HasTable(&model.PersonMergeSuggestionFailure{}) {
+		if err := db.AutoMigrate(&model.PersonMergeSuggestionFailure{}); err != nil {
+			return fmt.Errorf("create person_merge_suggestion_failures: %w", err)
+		}
+	}
+
+	indexes := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_pmsf_target ON person_merge_suggestion_failures(target_person_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pmsf_state_next ON person_merge_suggestion_failures(state, next_retry_at)`,
+	}
+	for _, sql := range indexes {
+		if err := db.Exec(sql).Error; err != nil {
+			return fmt.Errorf("create merge suggestion failure index: %w", err)
+		}
+	}
+
+	// 导入旧 retry_targets；成功后清空 JSON 字段，避免双写分叉。
+	var stateCfg model.AppConfig
+	if err := db.Where("key = ?", "people.merge_suggestions.state").First(&stateCfg).Error; err == nil && stateCfg.Value != "" {
+		var legacy struct {
+			RetryTargets []struct {
+				TargetID    uint      `json:"target_id"`
+				Attempts    int       `json:"attempts"`
+				NextRetryAt time.Time `json:"next_retry_at"`
+				Reason      string    `json:"reason"`
+			} `json:"retry_targets"`
+		}
+		if json.Unmarshal([]byte(stateCfg.Value), &legacy) == nil && len(legacy.RetryTargets) > 0 {
+			now := time.Now().UTC()
+			for _, e := range legacy.RetryTargets {
+				if e.TargetID == 0 {
+					continue
+				}
+				var n int64
+				if err := db.Model(&model.PersonMergeSuggestionFailure{}).
+					Where("target_person_id = ?", e.TargetID).Count(&n).Error; err != nil {
+					return fmt.Errorf("check legacy failure row: %w", err)
+				}
+				if n > 0 {
+					continue
+				}
+				attempts := e.Attempts
+				if attempts < 1 {
+					attempts = 1
+				}
+				row := model.PersonMergeSuggestionFailure{
+					TargetPersonID:   e.TargetID,
+					ReasonCode:       e.Reason,
+					Attempts:         attempts,
+					FirstFailedAt:    now,
+					LastFailedAt:     now,
+					BlockingDepsJSON: "[]",
+				}
+				if attempts >= 5 {
+					row.State = model.PersonMergeFailureStateExhausted
+				} else {
+					row.State = model.PersonMergeFailureStateRetryWait
+					next := e.NextRetryAt
+					if next.IsZero() {
+						next = now.Add(5 * time.Minute)
+					}
+					row.NextRetryAt = &next
+				}
+				if err := db.Create(&row).Error; err != nil {
+					return fmt.Errorf("import legacy retry target %d: %w", e.TargetID, err)
+				}
+			}
+			// 清空 retry_targets，保留其余扫描状态。
+			var raw map[string]interface{}
+			if json.Unmarshal([]byte(stateCfg.Value), &raw) == nil {
+				delete(raw, "retry_targets")
+				if payload, err := json.Marshal(raw); err == nil {
+					_ = db.Model(&model.AppConfig{}).Where("key = ?", "people.merge_suggestions.state").
+						Update("value", string(payload)).Error
+				}
+			}
+		}
+	}
+
+	db.Create(&model.AppConfig{Key: migrationKey, Value: "done"})
+	log.Printf("[database] merge suggestion failures v1 migration complete")
+	return nil
+}
+
+// migrateMergeSuggestionFailuresV2 为人工重试审计补列（已跑过 v1 的库也要补）。
+func migrateMergeSuggestionFailuresV2(db *gorm.DB) error {
+	const migrationKey = "migration.merge_suggestion_failures_v2"
+	var cfg model.AppConfig
+	if db.Where("key = ?", migrationKey).First(&cfg).Error == nil {
+		return nil
+	}
+	log.Printf("[database] migrating merge suggestion failures v2 (manual retry audit)...")
+	if db.Migrator().HasTable(&model.PersonMergeSuggestionFailure{}) {
+		if !db.Migrator().HasColumn(&model.PersonMergeSuggestionFailure{}, "ManualRetriedAt") {
+			if err := db.Migrator().AddColumn(&model.PersonMergeSuggestionFailure{}, "ManualRetriedAt"); err != nil {
+				return fmt.Errorf("add manual_retried_at: %w", err)
+			}
+		}
+		if !db.Migrator().HasColumn(&model.PersonMergeSuggestionFailure{}, "ManualRetryReason") {
+			if err := db.Migrator().AddColumn(&model.PersonMergeSuggestionFailure{}, "ManualRetryReason"); err != nil {
+				return fmt.Errorf("add manual_retry_reason: %w", err)
+			}
+		}
+	}
+	db.Create(&model.AppConfig{Key: migrationKey, Value: "done"})
+	log.Printf("[database] merge suggestion failures v2 migration complete")
+	return nil
+}
+
+// migrateMergeSuggestionFailuresV3 为依赖核对增加观测语义字段（未知 vs 已确认不可用 vs 已消费代次）。
+func migrateMergeSuggestionFailuresV3(db *gorm.DB) error {
+	const migrationKey = "migration.merge_suggestion_failures_v3"
+	var cfg model.AppConfig
+	if db.Where("key = ?", migrationKey).First(&cfg).Error == nil {
+		return nil
+	}
+	log.Printf("[database] migrating merge suggestion failures v3 (observation semantics)...")
+	if db.Migrator().HasTable(&model.PersonMergeSuggestionFailure{}) {
+		if !db.Migrator().HasColumn(&model.PersonMergeSuggestionFailure{}, "TargetObsKnown") {
+			if err := db.Migrator().AddColumn(&model.PersonMergeSuggestionFailure{}, "TargetObsKnown"); err != nil {
+				return fmt.Errorf("add target_obs_known: %w", err)
+			}
+		}
+		if !db.Migrator().HasColumn(&model.PersonMergeSuggestionFailure{}, "TargetConsumedGen") {
+			if err := db.Migrator().AddColumn(&model.PersonMergeSuggestionFailure{}, "TargetConsumedGen"); err != nil {
+				return fmt.Errorf("add target_consumed_generation: %w", err)
+			}
+		}
+		// 有真实 gen 的行：已知观测，consumed=gen，防重复消费。
+		// 列名跟 GORM 默认蛇形一致：TargetProfileGen→target_profile_gen，
+		// TargetConsumedGen→target_consumed_gen（勿用 JSON 名 target_profile_generation）。
+		if err := db.Exec(`UPDATE person_merge_suggestion_failures
+			SET target_obs_known = 1, target_consumed_gen = target_profile_gen
+			WHERE target_profile_gen > 0`).Error; err != nil {
+			return fmt.Errorf("backfill known generations: %w", err)
+		}
+		// gen=0 保持 target_obs_known=0（历史未知）；新 Upsert 会写 known=true。
+	}
+	db.Create(&model.AppConfig{Key: migrationKey, Value: "done"})
+	log.Printf("[database] merge suggestion failures v3 migration complete")
+	return nil
+}
+
+// migrateMergeSuggestionFailuresV4 增加尝试身份幂等键与人工安排断点字段。
+func migrateMergeSuggestionFailuresV4(db *gorm.DB) error {
+	const migrationKey = "migration.merge_suggestion_failures_v4"
+	var cfg model.AppConfig
+	if db.Where("key = ?", migrationKey).First(&cfg).Error == nil {
+		return nil
+	}
+	log.Printf("[database] migrating merge suggestion failures v4 (attempt key + arrange)...")
+	if db.Migrator().HasTable(&model.PersonMergeSuggestionFailure{}) {
+		cols := []string{"LastAttemptKey", "ManualArrangePending", "ManualArrangeRemainingJSON"}
+		for _, col := range cols {
+			if !db.Migrator().HasColumn(&model.PersonMergeSuggestionFailure{}, col) {
+				if err := db.Migrator().AddColumn(&model.PersonMergeSuggestionFailure{}, col); err != nil {
+					return fmt.Errorf("add %s: %w", col, err)
+				}
+			}
+		}
+	}
+	db.Create(&model.AppConfig{Key: migrationKey, Value: "done"})
+	log.Printf("[database] merge suggestion failures v4 migration complete")
 	return nil
 }

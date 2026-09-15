@@ -167,10 +167,27 @@ func NewServices(repos *repository.Repositories, cfg *config.Config, db *gorm.DB
 		} else {
 			logger.Warnf("Failed to create identity profile background DB pool: %v", err)
 		}
+		identityProfileService.(*personIdentityProfileService).SetEvidenceReadyHook(
+			mergeSuggestionService.(*personMergeSuggestionService).NotifyProfileEvidenceReady,
+		)
+		identityProfileService.(*personIdentityProfileService).SetIndexReadyHook(
+			mergeSuggestionService.(*personMergeSuggestionService).NotifyIndexReady,
+		)
+		mergeSuggestionService.(*personMergeSuggestionService).SetProfileRebuildHook(
+			func(personIDs []uint, reason string) error {
+				return identityProfileService.MarkDirty(personIDs, reason)
+			},
+		)
+		mergeSuggestionService.(*personMergeSuggestionService).SetProfileInvalidateHook(
+			func(personIDs []uint) {
+				identityProfileService.(*personIdentityProfileService).InvalidateANNOnly(personIDs)
+			},
+		)
 		// 非 legacy 模式：复用现有 identity profile service 的 ANN 与 embedding 模型签名，
 		// 以及现有 profile/face repository 装配合并建议的画像相似度 provider。
 		// 不创建第二个 ANN，不打开新连接池，不启动新 goroutine。
 		ann, embeddingModel := identityProfileService.(*personIdentityProfileService).ANN()
+		annReady := ann != nil && embeddingModel != "" && ann.Ready(embeddingModel)
 		if ann != nil && embeddingModel != "" {
 			provider := NewPersonProfileSimilarityProvider(
 				ann,
@@ -219,7 +236,8 @@ func NewServices(repos *repository.Repositories, cfg *config.Config, db *gorm.DB
 			peopleSvc.(*peopleService).SetIdentityMatchingEngine(engine)
 			peopleSvc.(*peopleService).SetIdentityAutoStrategy(NewIdentityAutoStrategy(cfg.People))
 			peopleSvc.(*peopleService).SetIdentityAssignmentRepo(repos.IdentityAssignment)
-			mergeSuggestionService.(*personMergeSuggestionService).SetIdentityMatchingEngine(engine)
+			// S1：引擎注入之后才做依赖核对（共享装配入口）；ANN 未就绪则 Pending 由后续切片/就绪回调补做。
+			mergeSuggestionService.(*personMergeSuggestionService).AttachIdentityMatchingWiring(engine, annReady)
 			mergeSuggestionService.(*personMergeSuggestionService).SetIdentityProfileMode(cfg.People.IdentityProfileMode)
 			mergeSuggestionService.(*personMergeSuggestionService).SetIdentitySuggestStrategy(NewIdentitySuggestStrategy(cfg.People))
 			mergeSuggestionService.(*personMergeSuggestionService).SetIdentityConfigFingerprint(IdentityStrategyFingerprint(cfg.People))

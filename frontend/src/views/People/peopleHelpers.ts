@@ -95,18 +95,68 @@ export function isMergeSuggestionWarning(item: Pick<PersonMergeSuggestionItem, '
 }
 
 export function getMergeSuggestionTaskStatusMeta(task?: Pick<PersonMergeSuggestionTask, 'status' | 'partial'> | string | null): TaskStatusMeta {
-  if (task && typeof task !== 'string' && task.partial) {
+  const status = typeof task === 'string' ? task : task?.status
+  const partial = !!(task && typeof task !== 'string' && task.partial)
+  // 暂停与问题计数同时可见，不被「部分完成」覆盖。
+  if (status === 'paused') {
+    return { label: partial ? '已暂停（有未解决问题）' : '已暂停', type: 'info' }
+  }
+  if (partial) {
     return { label: '部分完成', type: 'warning' }
   }
-  const status = typeof task === 'string' ? task : task?.status
   if (status === 'running') {
     return { label: '巡检中', type: 'warning' }
-  }
-  if (status === 'paused') {
-    return { label: '已暂停', type: 'info' }
   }
   if (status === 'idle') {
     return { label: '等待巡检', type: 'info' }
   }
   return { label: '未运行', type: 'info' }
+}
+
+export function getMergeSuggestionFailureStateLabel(state?: string, reasonCode?: string): string {
+  switch (state) {
+    case 'retry_wait':
+      return '等待画像恢复'
+    case 'exhausted':
+      return '重试已耗尽'
+    case 'waiting_evidence':
+      return '等待更多有效证据'
+    case 'resolved':
+      return reasonCode === 'zero_candidate' ? '巡检完成，无达标候选' : '已解决'
+    default:
+      return state || '未知'
+  }
+}
+
+export function getMergeSuggestionRetryFeedback(payload?: {
+  accepted_target_ids?: number[]
+  skipped?: { reason?: string }[]
+} | null): { kind: 'success' | 'warning' | 'info' | 'error'; message: string } | null {
+  if (!payload) return null
+  const skipped = payload.skipped || []
+  if (skipped.some(item => item.reason === 'waiting_evidence')) {
+    return { kind: 'warning', message: '目标仍在等待更多有效证据，未安排技术重试' }
+  }
+  if (skipped.some(item => item.reason === 'already_scheduled')) {
+    return { kind: 'info', message: '已有人工重试在队列中，未重复安排' }
+  }
+  if ((payload.accepted_target_ids || []).length > 0) {
+    return { kind: 'success', message: '已安排有界重验' }
+  }
+  if (skipped.length > 0) {
+    return { kind: 'warning', message: `未安排重试：${skipped.map(item => item.reason || 'unknown').join('，')}` }
+  }
+  return null
+}
+
+export function getMergeSuggestionEmptyResultMessage(task?: Pick<PersonMergeSuggestionTask, 'partial' | 'unresolved_target_count' | 'current_message'> | null): string {
+  if (!task) return ''
+  if ((task.unresolved_target_count || 0) > 0 || task.partial) {
+    return ''
+  }
+  const msg = task.current_message || ''
+  if (msg.includes('本轮巡检完成') || msg.includes('无达标')) {
+    return '巡检完成，无达标候选'
+  }
+  return ''
 }

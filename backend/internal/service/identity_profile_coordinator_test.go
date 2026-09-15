@@ -196,6 +196,72 @@ func TestCoordinator_ReplaceGenerationFailurePreservesOldGen(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, genBefore, cur.Profile.ActiveGeneration, "old generation preserved on write failure")
 	assert.Equal(t, model.PersonIdentityProfileStatusFailed, cur.Profile.Status)
+
+	got, ready := svc.ann.Search(vec3(1, 0, 0), 5, "emb")
+	if ready {
+		assert.NotContains(t, got, person.ID, "failed profile with preserved centers must leave the matching index")
+	}
+}
+
+// hookBuilder 在 Build 期间执行 hook，用于注入并发 Invalidate/MarkDirty。
+type hookBuilder struct {
+	hook  func()
+	inner identityProfileBuilderIface
+}
+
+func (b *hookBuilder) Build(personID uint, faces []*model.Face) (*model.PersonIdentityProfileBuild, error) {
+	if b.hook != nil {
+		b.hook()
+	}
+	if b.inner == nil {
+		b.inner = NewIdentityProfileBuilder(identityProfileBuilderConfig{
+			MaxCenters: 6, MinCenterFaces: 3, MinCenterPhotos: 2,
+		})
+	}
+	return b.inner.Build(personID, faces)
+}
+
+func TestCoordinator_ConcurrentInvalidateDoesNotSwallowDirty(t *testing.T) {
+	svc, deps := newCoordinatorTestService(t)
+	person := createPersonWithFaces(t, deps.repos, 100, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "first"))
+	require.NoError(t, svc.RunBackgroundSlice())
+	old, err := svc.GetActive(person.ID)
+	require.NoError(t, err)
+	require.Equal(t, model.PersonIdentityProfileStatusReady, old.Profile.Status)
+	genBefore := old.Profile.ActiveGeneration
+
+	var once sync.Once
+	var invalidateErr error
+	hook := &hookBuilder{hook: func() {
+		once.Do(func() {
+			invalidateErr = svc.Invalidate(IdentityProfileInvalidation{
+				DirtyPersonIDs: []uint{person.ID},
+				Reason:         "faces_moved",
+			})
+		})
+	}}
+	svc.builder = hook
+	svc.coordinator.builder = hook
+
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "second"))
+	advanceClockAndRun(svc, time.Second)
+	require.NoError(t, invalidateErr, "concurrent Invalidate must succeed")
+
+	var prof model.PersonIdentityProfile
+	require.NoError(t, deps.db.Where("person_id = ?", person.ID).First(&prof).Error)
+	assert.Equal(t, model.PersonIdentityProfileStatusDirty, prof.Status, "concurrent invalidate must not be overwritten to ready")
+	assert.Equal(t, "faces_moved", prof.DirtyReason)
+	cur, err := svc.GetActive(person.ID)
+	require.NoError(t, err)
+	assert.Equal(t, genBefore, cur.Profile.ActiveGeneration)
+
+	advanceClockAndRun(svc, time.Second)
+	after, err := svc.GetActive(person.ID)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	assert.Equal(t, model.PersonIdentityProfileStatusReady, after.Profile.Status)
+	assert.Greater(t, after.Profile.ActiveGeneration, genBefore)
 }
 
 // TestCoordinator_AnnActivateWhenDeltaSufficient 验证 delta 充足时批量 activate，
@@ -347,8 +413,6 @@ func TestCoordinator_ConcurrentBuildersNoSharedMutation(t *testing.T) {
 	}
 }
 
-
-
 // ---- Task 11: identity ANN rebuild 频率限制 ----
 
 // TestIdentityProfileCoordinator_AnnRebuildUsesCooldown 验证成功 rebuild 后进入 cooldown：
@@ -442,7 +506,55 @@ func TestIdentityProfileCoordinator_AnnRebuildCoordinatorRejectedKeepsPending(t 
 }
 
 // coordStatsLastAnnRebuildCount 返回 maybeRebuildANN 实际触发 rebuild 的累计次数
-//（annRebuildTotalCount），供测试断言 cooldown/coalescing 是否真正减少了 rebuild 次数。
+// （annRebuildTotalCount），供测试断言 cooldown/coalescing 是否真正减少了 rebuild 次数。
 func coordStatsLastAnnRebuildCount(coord *identityProfileCoordinator) int {
 	return coord.annRebuildTotalCount
+}
+
+func TestCoordinator_HistoricalFailedRecoversWithoutMarkingDirty(t *testing.T) {
+	svc, deps := newCoordinatorTestService(t)
+	person := createPersonWithFaces(t, deps.repos, 500, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "first"))
+	require.NoError(t, svc.RunBackgroundSlice())
+
+	require.NoError(t, deps.repos.IdentityProfile.MarkFailed(person.ID, "replace generation: database is locked"))
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, deps.db.Model(&model.PersonIdentityProfile{}).Where("person_id = ?", person.ID).Updates(map[string]interface{}{
+		"recovery_next_at":   t0,
+		"recovery_exhausted": false,
+	}).Error)
+
+	dirty, err := deps.repos.IdentityProfile.ListDirty(0, 10)
+	require.NoError(t, err)
+	assert.Empty(t, dirty)
+
+	advanceClockAndRun(svc, time.Second)
+	got, err := svc.GetActive(person.ID)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, model.PersonIdentityProfileStatusReady, got.Profile.Status)
+	assert.Equal(t, model.PersonIdentityBuildOutcomeUsable, got.Profile.BuildOutcome)
+}
+
+func TestCoordinator_ForegroundBusyDoesNotConsumeRecoveryBudget(t *testing.T) {
+	svc, deps := newCoordinatorTestService(t)
+	person := createPersonWithFaces(t, deps.repos, 600, vec3(1, 0, 0), vec3(0.98, 0.01, 0), vec3(0.99, 0, 0.01))
+	require.NoError(t, svc.MarkDirty([]uint{person.ID}, "first"))
+	require.NoError(t, svc.RunBackgroundSlice())
+	require.NoError(t, deps.repos.IdentityProfile.MarkFailed(person.ID, "replace generation: database is locked"))
+
+	var before model.PersonIdentityProfile
+	require.NoError(t, deps.db.Where("person_id = ?", person.ID).First(&before).Error)
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, deps.db.Model(&model.PersonIdentityProfile{}).Where("person_id = ?", person.ID).Updates(map[string]interface{}{
+		"recovery_next_at": t0,
+	}).Error)
+
+	svc.coordinator.setForegroundBusyFn(func() bool { return true })
+	advanceClockAndRun(svc, time.Second)
+
+	var after model.PersonIdentityProfile
+	require.NoError(t, deps.db.Where("person_id = ?", person.ID).First(&after).Error)
+	assert.Equal(t, model.PersonIdentityProfileStatusFailed, after.Status)
+	assert.Equal(t, before.RecoveryAttempts, after.RecoveryAttempts)
 }

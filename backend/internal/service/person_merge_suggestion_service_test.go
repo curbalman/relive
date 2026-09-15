@@ -19,7 +19,7 @@ import (
 func setupPersonMergeSuggestionServiceTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{Logger: gormlogger.Discard})
+	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared&_busy_timeout=5000"), &gorm.Config{Logger: gormlogger.Discard})
 	require.NoError(t, err)
 
 	require.NoError(t, db.AutoMigrate(
@@ -32,7 +32,11 @@ func setupPersonMergeSuggestionServiceTestDB(t *testing.T) *gorm.DB {
 		&model.CannotLinkConstraint{},
 		&model.PersonMergeSuggestion{},
 		&model.PersonMergeSuggestionItem{},
+		&model.PersonMergeSuggestionFailure{},
 		&model.PeopleFeedbackEvent{},
+		&model.PersonIdentityProfile{},
+		&model.PersonIdentityCenter{},
+		&model.PersonIdentityCenterMember{},
 	))
 
 	t.Cleanup(func() {

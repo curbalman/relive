@@ -323,6 +323,16 @@ func (s *stubMergeSuggestionService) GetPendingByID(id uint) (*model.PersonMerge
 	return s.detail, nil
 }
 
+func (s *stubMergeSuggestionService) ListFailures(page, pageSize int) ([]model.PersonMergeSuggestionFailureItem, int64, error) {
+	s.listPage = page
+	s.listPageSize = pageSize
+	return nil, 150, nil
+}
+
+func (s *stubMergeSuggestionService) RetryFailures(targetIDs []uint, reason string) (*model.PersonMergeFailureRetryResponse, error) {
+	return &model.PersonMergeFailureRetryResponse{AcceptedTargetIDs: append([]uint(nil), targetIDs...)}, nil
+}
+
 func (s *stubMergeSuggestionService) CalculateSimilarity(personID1, personID2 uint) (float64, error) {
 	return 0.75, s.err
 }
@@ -1006,6 +1016,38 @@ func TestPeopleHandler_GetMergeSuggestionTask(t *testing.T) {
 	task := decodeResponseData[model.PersonMergeSuggestionTask](t, resp)
 	assert.Equal(t, mergeSvc.task.Status, task.Status)
 	assert.Equal(t, mergeSvc.task.ProcessedPairs, task.ProcessedPairs)
+}
+
+func TestPeopleHandler_ListMergeSuggestionFailures(t *testing.T) {
+	handler, _, mergeSvc, _, _ := newPeopleHandlerForTest(t)
+	rec := performJSONRequest(t, http.MethodGet, "/api/v1/people/merge-suggestions/failures?page=1&page_size=20", nil, nil, handler.ListMergeSuggestionFailures)
+	require.Equal(t, http.StatusOK, rec.Code)
+	resp := decodeAPIResponse(t, rec)
+	require.True(t, resp.Success)
+	assert.Equal(t, 20, mergeSvc.listPageSize)
+}
+
+func TestPeopleHandler_ListMergeSuggestionFailures_ClampsPageSizeTo100(t *testing.T) {
+	// page_size=150 时若按 150 算 totalPages=1，而 repo 只返回 100，会静默丢 50 条。
+	handler, _, mergeSvc, _, _ := newPeopleHandlerForTest(t)
+	rec := performJSONRequest(t, http.MethodGet, "/api/v1/people/merge-suggestions/failures?page=1&page_size=150", nil, nil, handler.ListMergeSuggestionFailures)
+	require.Equal(t, http.StatusOK, rec.Code)
+	resp := decodeAPIResponse(t, rec)
+	payload := decodeResponseData[model.PagedResponse](t, resp)
+	assert.Equal(t, 100, mergeSvc.listPageSize)
+	assert.Equal(t, 100, payload.PageSize)
+	assert.Equal(t, int64(150), payload.Total)
+	assert.Equal(t, 2, payload.TotalPages)
+}
+
+func TestPeopleHandler_RetryMergeSuggestionFailures(t *testing.T) {
+	handler, _, _, _, _ := newPeopleHandlerForTest(t)
+	rec := performJSONRequest(t, http.MethodPost, "/api/v1/people/merge-suggestions/failures/retry",
+		[]byte(`{"target_ids":[264975]}`), nil, handler.RetryMergeSuggestionFailures)
+	require.Equal(t, http.StatusOK, rec.Code)
+	resp := decodeAPIResponse(t, rec)
+	data := decodeResponseData[model.PersonMergeFailureRetryResponse](t, resp)
+	require.Equal(t, []uint{264975}, data.AcceptedTargetIDs)
 }
 
 func TestPeopleHandler_ListMergeSuggestions(t *testing.T) {

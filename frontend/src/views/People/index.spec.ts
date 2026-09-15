@@ -49,6 +49,8 @@ const mockListMergeSuggestions = vi.fn()
 const mockGetMergeSuggestionTask = vi.fn()
 const mockGetMergeSuggestionStats = vi.fn()
 const mockGetMergeSuggestionLogs = vi.fn()
+const mockListMergeSuggestionFailures = vi.fn()
+const mockRetryMergeSuggestionFailures = vi.fn()
 
 vi.mock('@/api/people', () => ({
   peopleApi: {
@@ -57,6 +59,8 @@ vi.mock('@/api/people', () => ({
     getMergeSuggestionTask: (...a: unknown[]) => mockGetMergeSuggestionTask(...a),
     getMergeSuggestionStats: (...a: unknown[]) => mockGetMergeSuggestionStats(...a),
     getMergeSuggestionLogs: (...a: unknown[]) => mockGetMergeSuggestionLogs(...a),
+    listMergeSuggestionFailures: (...a: unknown[]) => mockListMergeSuggestionFailures(...a),
+    retryMergeSuggestionFailures: (...a: unknown[]) => mockRetryMergeSuggestionFailures(...a),
   },
 }))
 
@@ -172,6 +176,8 @@ describe('People/index.vue - 连续浏览虚拟化', () => {
     mockGetMergeSuggestionTask.mockResolvedValue({ data: { data: null } })
     mockGetMergeSuggestionStats.mockResolvedValue({ data: { data: null } })
     mockGetMergeSuggestionLogs.mockResolvedValue({ data: { data: { lines: [] } } })
+    mockListMergeSuggestionFailures.mockResolvedValue({ data: { data: { items: [], total: 0 } } })
+    mockRetryMergeSuggestionFailures.mockResolvedValue({ data: { data: { accepted_target_ids: [] } } })
   })
 
   it('翻页模式默认走 getList，使用 PersonCard v-for，不挂载 VirtualMediaGrid（测试项 9）', async () => {
@@ -432,6 +438,32 @@ describe('People/index.vue - 连续浏览虚拟化', () => {
     vm.onPeopleVisibleRange({ firstRowIndex: 0, lastRowIndex: 0, rowCount: 25 })
     await flushPromises()
     expect(mockGetList.mock.calls.length).toBe(callsAfterMount)
+    wrapper.unmount()
+  })
+})
+
+describe('People/index.vue - 合并推荐失败人工重试', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    localStorage.clear()
+    mockGetList.mockResolvedValue(paged([], 0))
+    mockListMergeSuggestions.mockResolvedValue({ data: { data: { items: [], total: 0 } } })
+    mockGetMergeSuggestionTask.mockResolvedValue({ data: { data: null } })
+    mockGetMergeSuggestionStats.mockResolvedValue({ data: { data: null } })
+    mockGetMergeSuggestionLogs.mockResolvedValue({ data: { data: { lines: [] } } })
+    mockListMergeSuggestionFailures.mockResolvedValue({ data: { data: { items: [], total: 0 } } })
+  })
+
+  it('RetryFailures API 抛错时走 ElMessage.error，不显示成功安排', async () => {
+    const { ElMessage } = await import('element-plus')
+    mockRetryMergeSuggestionFailures.mockRejectedValueOnce(new Error('load failure row 1001: boom'))
+    const wrapper = mountPeople(false)
+    await flushPromises()
+    const vm: any = wrapper.vm
+    await vm.handleRetryMergeSuggestionFailure(1001)
+    await flushPromises()
+    expect(ElMessage.error).toHaveBeenCalledWith('load failure row 1001: boom')
+    expect(ElMessage.success).not.toHaveBeenCalled()
     wrapper.unmount()
   })
 })

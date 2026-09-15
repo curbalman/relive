@@ -10,8 +10,11 @@ package service
 // IdentityStrategy（见 identity_matching_strategy.go）分别应用阈值与证据门槛。
 
 // identityEngineVersion 是统一身份匹配引擎的版本标识。
-// 打分公式、证据聚合或状态分类语义发生变化时必须提升该版本。
-const identityEngineVersion = "identity-engine-v3"
+// 打分公式、证据聚合、匹配资格口径或状态分类语义发生变化时必须提升该版本。
+// v4：ANN 全量装入与精排读取共用 ready+未隐藏+模型+活动代次 资格，failed 历史中心不再进入当前匹配。
+// v5：已确认无可用证据（build_outcome=no_usable_evidence）与技术 profile_unavailable 分轨，
+// 不再进入建议技术重试预算，也不伪装成有效 no_candidate。
+const identityEngineVersion = "identity-engine-v5"
 
 // IdentityMatchStatus 是引擎结果的固定分类。稳定字符串，可持久化到推荐与撤销日志。
 //
@@ -164,6 +167,8 @@ type IdentityMatchResult struct {
 	TargetProfileGeneration int
 	// IncompleteEvidence 表示召回候选中有证据不可读被跳过；不得视为完整成功空结果。
 	IncompleteEvidence bool
+	// MissingCandidateIDs 是召回命中但精排读不到可用证据的候选（技术缺失，不含确认无证据）。
+	MissingCandidateIDs []uint
 	// Candidates 是本次参与排序的全部候选（含被硬阻断者），按分数降序、人物 ID 升序。
 	Candidates []IdentityCandidateResult
 }

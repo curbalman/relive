@@ -290,6 +290,8 @@ func Setup(db *gorm.DB, cfg *config.Config, appState *lifecycle.State) (*gin.Eng
 				people.POST("/merge-suggestions/background/pause", handlers.People.PauseMergeSuggestionTask)
 				people.POST("/merge-suggestions/background/resume", handlers.People.ResumeMergeSuggestionTask)
 				people.POST("/merge-suggestions/background/rebuild", handlers.People.RebuildMergeSuggestionTask)
+				people.GET("/merge-suggestions/failures", handlers.People.ListMergeSuggestionFailures)
+				people.POST("/merge-suggestions/failures/retry", handlers.People.RetryMergeSuggestionFailures)
 				people.GET("/merge-suggestions", handlers.People.ListMergeSuggestions)
 				people.GET("/merge-suggestions/:id", handlers.People.GetMergeSuggestion)
 				people.POST("/merge-suggestions/:id/exclude", handlers.People.ExcludeMergeSuggestionCandidates)

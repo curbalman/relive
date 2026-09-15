@@ -801,6 +801,52 @@ func (h *PeopleHandler) RebuildMergeSuggestionTask(c *gin.Context) {
 	c.JSON(http.StatusOK, model.Response{Success: true, Message: "人物合并建议后台任务已重建"})
 }
 
+func (h *PeopleHandler) ListMergeSuggestionFailures(c *gin.Context) {
+	page, pageSize, ok := parsePagination(c)
+	if !ok {
+		return
+	}
+	// §6：failures 列表 page_size 上限 100，须与 ListUnresolved 一致，避免 handler 用更大 pageSize
+	// 算 totalPages 而 repo 静默截断导致丢页。
+	const failuresPageSizeCap = 100
+	if pageSize > failuresPageSizeCap {
+		pageSize = failuresPageSizeCap
+	}
+	items, total, err := h.mergeSuggestionService.ListFailures(page, pageSize)
+	if err != nil {
+		writePeopleError(c, http.StatusInternalServerError, "LIST_FAILURES_FAILED", err.Error())
+		return
+	}
+	totalPages := 0
+	if total > 0 {
+		totalPages = int((total + int64(pageSize) - 1) / int64(pageSize))
+	}
+	c.JSON(http.StatusOK, model.Response{
+		Success: true,
+		Data: model.PagedResponse{
+			Items:      items,
+			Total:      total,
+			Page:       page,
+			PageSize:   pageSize,
+			TotalPages: totalPages,
+		},
+	})
+}
+
+func (h *PeopleHandler) RetryMergeSuggestionFailures(c *gin.Context) {
+	var req model.PersonMergeFailureRetryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writePeopleError(c, http.StatusBadRequest, "INVALID_REQUEST", err.Error())
+		return
+	}
+	resp, err := h.mergeSuggestionService.RetryFailures(req.TargetIDs, "manual_retry")
+	if err != nil {
+		writeServiceFailure(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, model.Response{Success: true, Data: resp})
+}
+
 func (h *PeopleHandler) ListMergeSuggestions(c *gin.Context) {
 	page, pageSize, ok := parsePagination(c)
 	if !ok {

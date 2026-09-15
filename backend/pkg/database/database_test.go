@@ -376,6 +376,74 @@ func TestAutoMigrateAddsPersonIdentity(t *testing.T) {
 	}
 }
 
+func TestAutoMigrateAddsMergeSuggestionFailureObsAndAttemptColumns(t *testing.T) {
+	db := openMigratedTestDB(t)
+	for _, col := range []string{
+		"target_obs_known",
+		"target_consumed_gen",
+		"last_attempt_key",
+		"manual_arrange_pending",
+		"manual_arrange_remaining_json",
+	} {
+		if !db.Migrator().HasColumn(&model.PersonMergeSuggestionFailure{}, col) {
+			t.Fatalf("expected person_merge_suggestion_failures.%s after v3/v4 migration", col)
+		}
+	}
+	// v3 backfill：已有 gen>0 的行标 known + consumed=gen；gen=0 保持未知。
+	now := time.Now().UTC()
+	require.NoError(t, db.Exec(`INSERT INTO person_merge_suggestion_failures
+		(target_person_id, state, reason_code, attempts, first_failed_at, last_failed_at,
+		 target_profile_gen, target_obs_known, target_consumed_gen, blocking_deps_json, created_at, updated_at)
+		VALUES (101, 'exhausted', 'profile_unavailable', 5, ?, ?, 3, 0, 0, '[]', ?, ?)`,
+		now, now, now, now).Error)
+	require.NoError(t, db.Exec(`INSERT INTO person_merge_suggestion_failures
+		(target_person_id, state, reason_code, attempts, first_failed_at, last_failed_at,
+		 target_profile_gen, target_obs_known, target_consumed_gen, blocking_deps_json, created_at, updated_at)
+		VALUES (102, 'exhausted', 'profile_unavailable', 5, ?, ?, 0, 0, 0, '[]', ?, ?)`,
+		now, now, now, now).Error)
+	// 模拟已跑过 AutoMigrate 但尚未跑 v3 标记时的 backfill（直接调用与生产相同 SQL）。
+	require.NoError(t, db.Exec(`UPDATE person_merge_suggestion_failures
+		SET target_obs_known = 1, target_consumed_gen = target_profile_gen
+		WHERE target_profile_gen > 0`).Error)
+
+	var known, consumed int
+	require.NoError(t, db.Raw(`SELECT target_obs_known, target_consumed_gen FROM person_merge_suggestion_failures WHERE target_person_id=101`).
+		Row().Scan(&known, &consumed))
+	assert.Equal(t, 1, known)
+	assert.Equal(t, 3, consumed)
+	require.NoError(t, db.Raw(`SELECT target_obs_known, target_consumed_gen FROM person_merge_suggestion_failures WHERE target_person_id=102`).
+		Row().Scan(&known, &consumed))
+	assert.Equal(t, 0, known)
+	assert.Equal(t, 0, consumed)
+}
+
+func TestAutoMigrateAddsIdentityProfileRecoveryColumns(t *testing.T) {
+	db := openMigratedTestDB(t)
+	for _, col := range []string{
+		"change_revision",
+		"recovery_attempts",
+		"recovery_next_at",
+		"recovery_exhausted",
+		"recovery_error_class",
+		"last_failed_at",
+		"build_outcome",
+		"evidence_version",
+	} {
+		if !db.Migrator().HasColumn(&model.PersonIdentityProfile{}, col) {
+			t.Fatalf("expected person_identity_profiles.%s after recovery migration", col)
+		}
+	}
+	for _, indexName := range []string{"idx_pip_recovery_due", "idx_pip_build_outcome"} {
+		var count int64
+		if err := db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?", indexName).Scan(&count).Error; err != nil {
+			t.Fatalf("query index %s: %v", indexName, err)
+		}
+		if count != 1 {
+			t.Fatalf("expected index %s to exist after recovery migration", indexName)
+		}
+	}
+}
+
 func TestPhotoAnalysisFieldsMigrated(t *testing.T) {
 	db := openMigratedTestDB(t)
 
@@ -522,7 +590,7 @@ func TestMigrateFaceQualityEvidenceOrigin(t *testing.T) {
 	// 2) 真实模型 0 分但有 evidence：不应被标 missing。
 	realZero := &model.FaceQualityEvent{
 		PhotoID: 2,
-		BBoxX: 0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
+		BBoxX:   0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
 		Decision: model.FaceQualityDecisionReviewRequired,
 		Source:   model.FaceQualitySourceAuto, RuleVersion: "v1", ModelVersion: "test-v1",
 		EvidenceJSON:   `{"face_validity_score":0,"pixel_width":50}`,
@@ -534,7 +602,7 @@ func TestMigrateFaceQualityEvidenceOrigin(t *testing.T) {
 	// 3) 人工事件：source=manual，不应被该迁移动。
 	manualEvt := &model.FaceQualityEvent{
 		PhotoID: 3,
-		BBoxX: 0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
+		BBoxX:   0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
 		Decision: model.FaceQualityDecisionAccepted,
 		Source:   model.FaceQualitySourceManual, RuleVersion: "v1", ModelVersion: "test-v1",
 		EvidenceJSON:   "",
@@ -546,7 +614,7 @@ func TestMigrateFaceQualityEvidenceOrigin(t *testing.T) {
 	// 4) 非当前历史缺证据：is_current=false，不应被标（只处理 is_current=1）。
 	notCurrent := &model.FaceQualityEvent{
 		PhotoID: 4,
-		BBoxX: 0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
+		BBoxX:   0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
 		Decision: model.FaceQualityDecisionReviewRequired,
 		Source:   model.FaceQualitySourceAuto, RuleVersion: "v1", ModelVersion: "test-v1",
 		EvidenceJSON:   "",
@@ -559,7 +627,7 @@ func TestMigrateFaceQualityEvidenceOrigin(t *testing.T) {
 	//    迁移应把 state 回填为 available，使其留在 pending_review，不被漏出所有队列。
 	legacyRealtime := &model.FaceQualityEvent{
 		PhotoID: 5,
-		BBoxX: 0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
+		BBoxX:   0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
 		Decision: model.FaceQualityDecisionReviewRequired,
 		Source:   model.FaceQualitySourceAuto, RuleVersion: "v1", ModelVersion: "test-v1",
 		EvidenceJSON:   `{"face_validity_score":0.55,"pixel_width":60}`,
@@ -639,7 +707,7 @@ func TestMigrateFaceQualityRescoreRunMeta(t *testing.T) {
 	require.NoError(t, db.Create(&model.FaceQualityRescoreItem{
 		RunID: run1.ID, PhotoID: 1, FaceID: 100,
 		BBoxX: 0, BBoxY: 0, BBoxWidth: 0, BBoxHeight: 0,
-		Status: model.FaceQualityRescoreItemStatusRetryableError,
+		Status:    model.FaceQualityRescoreItemStatusRetryableError,
 		LastError: "score known faces returned status 422",
 	}).Error)
 
@@ -693,7 +761,7 @@ func TestMigrateFaceQualityEvidencePipeline(t *testing.T) {
 		PhotoID: 2, BBoxX: 0.1, BBoxY: 0.1, BBoxWidth: 0.2, BBoxHeight: 0.2,
 		Decision: model.FaceQualityDecisionNonFace,
 		Source:   model.FaceQualitySourceAuto, RuleVersion: "face_quality_v2", ModelVersion: "yunet-v1",
-		EvidenceOrigin:  model.FaceQualityEvidenceOriginHistoricalRescore,
+		EvidenceOrigin:   model.FaceQualityEvidenceOriginHistoricalRescore,
 		EvidencePipeline: model.FaceQualityEvidencePipelineIndependentV2,
 		IsCurrent:        true,
 	}

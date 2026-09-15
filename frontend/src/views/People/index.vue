@@ -377,6 +377,67 @@
                   · 身份重试 <strong>{{ mergeSuggestionTask.retry_total_count }}</strong>
                   （到期 {{ mergeSuggestionTask.retry_due_count || 0 }} / 延期 {{ mergeSuggestionTask.retry_deferred_count || 0 }}）
                 </span>
+                <span v-if="mergeSuggestionTask?.retry_exhausted_count">
+                  · 重试已耗尽 <strong>{{ mergeSuggestionTask.retry_exhausted_count }}</strong>
+                </span>
+                <span v-if="mergeSuggestionTask?.waiting_evidence_count">
+                  · 等待证据 <strong>{{ mergeSuggestionTask.waiting_evidence_count }}</strong>
+                </span>
+                <span v-if="mergeSuggestionTask?.unresolved_target_count">
+                  · 未解决 <strong>{{ mergeSuggestionTask.unresolved_target_count }}</strong>
+                </span>
+              </div>
+
+              <div v-if="mergeSuggestionEmptyMessage" class="task-phase">
+                <span class="task-phase-label">结果</span>
+                <span class="task-phase-message">{{ mergeSuggestionEmptyMessage }}</span>
+              </div>
+
+              <div v-if="(mergeSuggestionTask?.unresolved_target_count || 0) > 0" class="merge-failure-panel">
+                <div class="merge-failure-header">
+                  <span>未解决目标</span>
+                  <el-button
+                    size="small"
+                    plain
+                    class="mini-action-btn"
+                    :loading="mergeFailureLoading"
+                    @click="loadMergeSuggestionFailures()"
+                  >
+                    {{ mergeFailuresExpanded ? '刷新详情' : '展开详情' }}
+                  </el-button>
+                </div>
+                <div v-if="mergeFailuresExpanded" v-loading="mergeFailureLoading" class="merge-failure-list">
+                  <div v-if="mergeFailures.length === 0" class="background-log-empty">暂无未解决目标</div>
+                  <div
+                    v-for="row in mergeFailures"
+                    :key="row.target_person_id"
+                    class="merge-failure-row"
+                  >
+                    <div class="merge-failure-main">
+                      <strong>#{{ row.target_person_id }}</strong>
+                      <span class="status-pill warning">{{ getMergeSuggestionFailureStateLabel(row.state, row.reason_code) }}</span>
+                      <span class="merge-failure-meta">尝试 {{ row.attempts }}</span>
+                      <span v-if="row.blocking_person_ids?.length" class="merge-failure-meta">
+                        阻塞 {{ row.blocking_person_ids.join(', ') }}
+                      </span>
+                    </div>
+                    <el-button
+                      size="small"
+                      type="primary"
+                      plain
+                      :loading="mergeFailureRetryingId === row.target_person_id"
+                      :disabled="row.state === 'waiting_evidence' && row.reason_code === 'no_usable_evidence'"
+                      @click="handleRetryMergeSuggestionFailure(row.target_person_id)"
+                    >
+                      人工重试
+                    </el-button>
+                  </div>
+                  <div v-if="mergeFailureTotal > mergeFailures.length" class="merge-failure-more">
+                    <el-button size="small" plain :loading="mergeFailureLoading" @click="loadMoreMergeSuggestionFailures()">
+                      加载更多（{{ mergeFailures.length }}/{{ mergeFailureTotal }}）
+                    </el-button>
+                  </div>
+                </div>
               </div>
             </div>
           </el-card>
@@ -459,6 +520,7 @@ import type {
   Person,
   PersonCategory,
   PersonMergeSuggestion,
+  PersonMergeSuggestionFailureItem,
   PersonMergeSuggestionStats,
   PersonMergeSuggestionTask,
 } from '@/types/people'
@@ -468,6 +530,9 @@ import PersonCard from './PersonCard.vue'
 import PersonEditDialog from './PersonEditDialog.vue'
 import PersonMergeConfirmDialog from './PersonMergeConfirmDialog.vue'
 import {
+  getMergeSuggestionEmptyResultMessage,
+  getMergeSuggestionFailureStateLabel,
+  getMergeSuggestionRetryFeedback,
   getMergeSuggestionTaskStatusMeta,
   getMergeSuggestionVisibility,
   getPeopleTaskStatusMeta,
@@ -685,6 +750,12 @@ const mergeSuggestionSubmitting = ref(false)
 const currentMergeSuggestion = ref<PersonMergeSuggestion | null>(null)
 const currentMergeSuggestionId = ref<number | null>(null)
 const mergeSuggestionAction = ref<'pause' | 'resume' | 'rebuild' | ''>('')
+const mergeFailuresExpanded = ref(false)
+const mergeFailureLoading = ref(false)
+const mergeFailures = ref<PersonMergeSuggestionFailureItem[]>([])
+const mergeFailureTotal = ref(0)
+const mergeFailurePage = ref(1)
+const mergeFailureRetryingId = ref<number | null>(null)
 
 const starting = ref(false)
 const stopping = ref(false)
@@ -762,6 +833,7 @@ const queueProgressPercent = computed(() => {
 
 const mergeSuggestionVisible = computed(() => getMergeSuggestionVisibility(mergeSuggestionTotal.value, mergeSuggestionLoading.value))
 const mergeSuggestionTaskMeta = computed(() => getMergeSuggestionTaskStatusMeta(mergeSuggestionTask.value))
+const mergeSuggestionEmptyMessage = computed(() => getMergeSuggestionEmptyResultMessage(mergeSuggestionTask.value))
 
 const parseVisibility = (raw: unknown): PeopleVisibility => {
   return raw === 'hidden' || raw === 'all' ? (raw as PeopleVisibility) : 'visible'
@@ -887,6 +959,66 @@ const loadMergeSuggestionTaskData = async () => {
   mergeSuggestionTask.value = taskRes.data?.data || null
   mergeSuggestionStats.value = statsRes.data?.data || mergeSuggestionStats.value
   mergeSuggestionLogs.value = logsRes.data?.data?.lines || []
+  if ((mergeSuggestionTask.value?.unresolved_target_count || 0) === 0) {
+    mergeFailuresExpanded.value = false
+    mergeFailures.value = []
+    mergeFailureTotal.value = 0
+    mergeFailurePage.value = 1
+  } else if (mergeFailuresExpanded.value) {
+    await loadMergeSuggestionFailures(true)
+  }
+}
+
+const loadMergeSuggestionFailures = async (silent = false) => {
+  // 模板必须写 loadMergeSuggestionFailures()；若误写成无括号，click 会把 Event 当 silent。
+  const silentOnly = silent === true
+  if (!silentOnly) {
+    mergeFailuresExpanded.value = true
+  }
+  mergeFailureLoading.value = true
+  mergeFailurePage.value = 1
+  try {
+    const res = await peopleApi.listMergeSuggestionFailures({ page: 1, page_size: 20 })
+    mergeFailures.value = res.data?.data?.items || []
+    mergeFailureTotal.value = Number(res.data?.data?.total || 0)
+  } catch (error: any) {
+    ElMessage.error(error.message || '加载未解决目标失败')
+  } finally {
+    mergeFailureLoading.value = false
+  }
+}
+
+const loadMoreMergeSuggestionFailures = async () => {
+  mergeFailureLoading.value = true
+  try {
+    const nextPage = mergeFailurePage.value + 1
+    const res = await peopleApi.listMergeSuggestionFailures({ page: nextPage, page_size: 20 })
+    const items = res.data?.data?.items || []
+    mergeFailures.value = [...mergeFailures.value, ...items]
+    mergeFailureTotal.value = Number(res.data?.data?.total || mergeFailureTotal.value)
+    mergeFailurePage.value = nextPage
+  } catch (error: any) {
+    ElMessage.error(error.message || '加载更多失败')
+  } finally {
+    mergeFailureLoading.value = false
+  }
+}
+
+const handleRetryMergeSuggestionFailure = async (targetId: number) => {
+  mergeFailureRetryingId.value = targetId
+  try {
+    const res = await peopleApi.retryMergeSuggestionFailures([targetId])
+    const feedback = getMergeSuggestionRetryFeedback(res.data?.data)
+    if (feedback?.kind === 'warning') ElMessage.warning(feedback.message)
+    else if (feedback?.kind === 'info') ElMessage.info(feedback.message)
+    else if (feedback?.kind === 'success') ElMessage.success(feedback.message)
+    else if (feedback?.kind === 'error') ElMessage.error(feedback.message)
+    await Promise.all([loadMergeSuggestionTaskData(), loadMergeSuggestionFailures(true)])
+  } catch (error: any) {
+    ElMessage.error(error.message || '人工重试失败')
+  } finally {
+    mergeFailureRetryingId.value = null
+  }
 }
 
 const loadTaskData = async () => {
@@ -2138,6 +2270,57 @@ const setupPeopleResizeObserver = () => {
   font-size: 22px;
   line-height: 1;
   color: var(--color-text-primary);
+}
+
+.merge-failure-panel {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.merge-failure-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.merge-failure-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 24px;
+}
+
+.merge-failure-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-soft);
+}
+
+.merge-failure-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.merge-failure-meta {
+  color: var(--color-text-secondary);
+  font-size: 12px;
+}
+
+.merge-failure-more {
+  display: flex;
+  justify-content: center;
+  padding-top: 4px;
 }
 
 @media (max-width: 1200px) {

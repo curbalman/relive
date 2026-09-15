@@ -174,15 +174,9 @@ func (a *identityProfileANN) Search(query []float32, k int, model string) ([]uin
 		a.searchMu.Unlock()
 		for _, n := range nodes {
 			centerID := n.Key
-			if _, bad := invalidCopy[centerID]; bad {
-				continue
-			}
 			personID, ok := snap.centerOwner[centerID]
-			if !ok || personID == 0 {
+			if !ok || !centerQueryable(centerID, personID, snap.generation[centerID], invalidCopy, activeGen) {
 				continue
-			}
-			if active, ok := activeGen[personID]; ok && snap.generation[centerID] != active {
-				continue // 旧 generation 中心被新 generation 取代
 			}
 			if _, dup := seen[personID]; dup {
 				continue
@@ -194,14 +188,8 @@ func (a *identityProfileANN) Search(query []float32, k int, model string) ([]uin
 
 	// 5. delta 精确 cosine 计算。
 	for id, v := range deltaCopy {
-		if _, bad := invalidCopy[id]; bad {
+		if !centerQueryable(id, v.PersonID, v.Generation, invalidCopy, activeGen) {
 			continue
-		}
-		if v.PersonID == 0 {
-			continue
-		}
-		if active, ok := activeGen[v.PersonID]; ok && v.Generation != active {
-			continue // delta 中被再次替换的旧中心
 		}
 		if _, dup := seen[v.PersonID]; dup {
 			continue
@@ -291,19 +279,13 @@ func (a *identityProfileANN) ExactTopPeople(query []float32, k int, model string
 	}
 
 	for _, c := range snap.centers {
-		if _, bad := invalidCopy[c.CenterID]; bad {
-			continue
-		}
-		if active, ok := activeGen[c.PersonID]; ok && c.Generation != active {
+		if !centerQueryable(c.CenterID, c.PersonID, c.Generation, invalidCopy, activeGen) {
 			continue
 		}
 		consider(c.PersonID, c.Embedding)
 	}
 	for id, v := range deltaCopy {
-		if _, bad := invalidCopy[id]; bad {
-			continue
-		}
-		if active, ok := activeGen[v.PersonID]; ok && v.Generation != active {
+		if !centerQueryable(id, v.PersonID, v.Generation, invalidCopy, activeGen) {
 			continue
 		}
 		consider(v.PersonID, v.Embedding)
@@ -691,6 +673,22 @@ func deriveActiveGeneration(idx *identityCenterIndex) map[uint]int {
 		out[personID] = idx.generation[centerID]
 	}
 	return out
+}
+
+// centerQueryable 是 Search 与 ExactTopPeople 共用的内存过滤：跳过 invalid、
+// 无 owner，以及被新 generation 取代的旧中心。profile.status 不在 ANN 快照中；
+// ready→dirty/failed/隐藏 必须先 InvalidatePerson，全量重建则只装入 matchEligibleCenterQuery 的结果。
+func centerQueryable(centerID, personID uint, generation int, invalid map[uint]struct{}, activeGen map[uint]int) bool {
+	if personID == 0 {
+		return false
+	}
+	if _, bad := invalid[centerID]; bad {
+		return false
+	}
+	if active, ok := activeGen[personID]; ok && generation != active {
+		return false
+	}
+	return true
 }
 
 // validVector 校验向量非空、无 NaN/Inf、范数非零。
