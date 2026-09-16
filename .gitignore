@@ -76,6 +76,8 @@ backend/relive
 backend/relive-analyzer
 backend/relive-people-worker
 backend/relive-identity-profile-report
+backend/relive-identity-recovery-verify
+backend/relive-identity-recovery-verify.bin
 backend/relive-duplicate-face-audit
 
 # Config files with sensitive data
@@ -105,3 +107,6 @@ ml-service/assets/yunet/*.onnx
 
 .worktrees/
 .claude/worktrees/
+
+# Local Playwright CLI session dumps (page snapshots / console logs)
+.playwright-cli/
