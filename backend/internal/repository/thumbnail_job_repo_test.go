@@ -137,3 +137,40 @@ func TestThumbnailJobRepo_UpdateFields(t *testing.T) {
 	assert.Equal(t, model.ThumbnailJobStatusCompleted, got.Status)
 	assert.Equal(t, 1, got.AttemptCount)
 }
+
+func TestThumbnailJobRepo_HeartbeatFencesRecoveryAndOldClaim(t *testing.T) {
+	db := setupTestDB(t)
+	defer teardownTestDB(db)
+	repo := NewThumbnailJobRepository(db)
+	job := &model.ThumbnailJob{PhotoID: 1, FilePath: "/a.jpg", Source: model.ThumbnailJobSourceManual,
+		Status: model.ThumbnailJobStatusQueued, QueuedAt: time.Now()}
+	require.NoError(t, repo.Create(job))
+	claim, err := repo.ClaimNextJob()
+	require.NoError(t, err)
+	require.NotNil(t, claim)
+	cutoff := time.Now().Add(-15 * time.Minute)
+	require.NoError(t, db.Model(&model.ThumbnailJob{}).Where("id = ?", job.ID).UpdateColumn("updated_at", cutoff.Add(-time.Minute)).Error)
+	stale, err := repo.ListStaleProcessing(cutoff)
+	require.NoError(t, err)
+	require.Len(t, stale, 1)
+	owned, err := repo.UpdateProcessing(claim, map[string]interface{}{"updated_at": time.Now()})
+	require.NoError(t, err)
+	require.True(t, owned)
+	recovered, err := repo.UpdateStaleProcessing(&stale[0], cutoff, map[string]interface{}{"status": model.ThumbnailJobStatusQueued})
+	require.NoError(t, err)
+	assert.False(t, recovered)
+	// Expire it again and reclaim it; the old claim can no longer renew or finish.
+	require.NoError(t, db.Model(&model.ThumbnailJob{}).Where("id = ?", job.ID).UpdateColumn("updated_at", cutoff.Add(-time.Minute)).Error)
+	recovered, err = repo.UpdateStaleProcessing(claim, cutoff, map[string]interface{}{"status": model.ThumbnailJobStatusQueued, "started_at": nil})
+	require.NoError(t, err)
+	require.True(t, recovered)
+	current, err := repo.ClaimNextJob()
+	require.NoError(t, err)
+	require.NotNil(t, current)
+	owned, err = repo.UpdateProcessing(claim, map[string]interface{}{"status": model.ThumbnailJobStatusCompleted})
+	require.NoError(t, err)
+	assert.False(t, owned)
+	owned, err = repo.UpdateProcessing(claim, map[string]interface{}{"updated_at": time.Now()})
+	require.NoError(t, err)
+	assert.False(t, owned)
+}

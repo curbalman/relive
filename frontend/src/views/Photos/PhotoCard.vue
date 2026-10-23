@@ -60,7 +60,7 @@
         <span
           class="photo-status-icon"
           :class="photo.location ? 'is-ready' : 'is-idle'"
-          :title="photo.gps_latitude && photo.gps_longitude ? 'GPS 位置状态' : '无 GPS 信息'"
+          :title="hasValidGPS(photo) ? 'GPS 位置状态' : '无 GPS 信息'"
         >
           <el-icon><Location /></el-icon>
         </span>
@@ -89,6 +89,7 @@
 </template>
 
 <script setup lang="ts">
+import { hasValidGPS } from '@/utils/gps'
 import { Clock, Files, FullScreen, Loading, Location, MagicStick, PictureFilled, Select, Star } from '@element-plus/icons-vue'
 import type { Photo } from '@/types/photo'
 

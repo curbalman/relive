@@ -505,7 +505,9 @@ func (s *photoService) runScanTask(runtime *activeScanJob, path string, rebuild 
 			}
 		}
 	}
-	if s.eventClusteringService != nil {
+	if s.eventClusteringService != nil && (rebuild || progress.newPhotosSnapshot() > 0 || progress.updatedPhotosSnapshot() > 0 || progress.deletedPhotosSnapshot() > 0) {
+		// Unchanged scans must not repeatedly rediscover the same photos that
+		// do not yet form a complete event.
 		go s.eventClusteringService.RunIncremental()
 	}
 

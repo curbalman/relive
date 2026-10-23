@@ -51,11 +51,11 @@
             <el-button @click="handleThumbnail" :loading="thumbnailing">
               {{ thumbnailing ? '生成中...' : (photo?.thumbnail_status === 'ready' ? '重新生成缩略图' : '生成缩略图') }}
             </el-button>
-            <el-button @click="handleGeocode" :loading="geocoding" :disabled="!photo?.gps_latitude || !photo?.gps_longitude">
+            <el-button @click="handleGeocode" :loading="geocoding" :disabled="!hasValidGPS(photo)">
               {{ geocoding ? '解析中...' : (photo?.location ? '重新解析 GPS' : '解析 GPS') }}
             </el-button>
             <el-button @click="showLocationPicker = true">
-              {{ photo?.gps_latitude && photo?.gps_longitude ? '修改位置' : '设置位置' }}
+              {{ hasValidGPS(photo) ? '修改位置' : '设置位置' }}
             </el-button>
             <el-tooltip
               content="需要先配置 AI Provider 才能使用分析功能"
@@ -131,7 +131,7 @@
               </div>
             </el-descriptions-item>
             <el-descriptions-item label="GPS 坐标">
-              {{ photo.gps_latitude && photo.gps_longitude
+              {{ hasValidGPS(photo)
                 ? `${photo.gps_latitude.toFixed(6)}, ${photo.gps_longitude.toFixed(6)}`
                 : '-' }}
             </el-descriptions-item>
@@ -473,6 +473,7 @@
 </template>
 
 <script setup lang="ts">
+import { hasValidGPS } from '@/utils/gps'
 import { computed, ref, nextTick, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ArrowLeft, ArrowRight, InfoFilled, Delete, RefreshRight, RefreshLeft, Edit, View } from '@element-plus/icons-vue'

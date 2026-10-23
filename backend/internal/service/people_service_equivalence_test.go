@@ -2,40 +2,48 @@ package service
 
 import (
 	"math"
-	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 
 	"github.com/davidhoo/relive/internal/model"
 	"github.com/davidhoo/relive/internal/repository"
 	"github.com/davidhoo/relive/pkg/config"
-	"github.com/davidhoo/relive/pkg/database"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
-// TestClusteringEquivalence 验证优化前后聚类结果完全一致
-// 注意：此测试需要本地数据库文件，如果没有会跳过
+// TestClusteringEquivalence uses a deterministic, isolated fixture with the current
+// schema. It must exercise clustering even when no developer database exists.
 func TestClusteringEquivalence(t *testing.T) {
-	dbPath := "../../data/relive.db"
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "equivalence.db")), &gorm.Config{})
+	require.NoError(t, err)
+	sqlDB, err := db.DB()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+	require.NoError(t, db.AutoMigrate(&model.Photo{}, &model.Face{}, &model.Person{}, &model.PeopleMergeJob{}))
 
-	// 检查数据库文件是否存在
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		t.Skip("Database file not found, skipping equivalence test. Run with local data/relive.db to enable.")
-	}
-
-	cfg := &config.Config{
-		Database: config.DatabaseConfig{
-			Type: "sqlite",
-			Path: dbPath,
-		},
-	}
-
-	db, err := database.Init(cfg.Database)
-	if err != nil {
-		t.Fatalf("Failed to init database: %v", err)
-	}
-
+	cfg := &config.Config{People: config.PeopleConfig{FaceQualityMode: "disabled"}}
 	repos := repository.NewRepositories(db)
 	svc := NewPeopleService(db, repos.Photo, repos.Face, repos.Person, repos.PeopleJob, repos.PeopleMergeJob, repos.CannotLink, cfg, nil, nil).(*peopleService)
+	t.Cleanup(func() { svc.clusteringCoordinator.stop() })
+
+	// Two known identities, two distinct pending groups and an unmatched face.
+	for _, id := range []uint{1, 2} {
+		require.NoError(t, db.Create(&model.Person{ID: id}).Error)
+	}
+	vectors := [][]float32{{1, 0, 0}, {0.99, 0.1, 0}, {0, 1, 0}, {0.1, 0.99, 0}, {0, 0, 1}, {1, 0, 0}, {0.99, 0.1, 0}, {0, 1, 0}, {0.1, 0.99, 0}}
+	for i, vector := range vectors {
+		face := &model.Face{ID: uint(i + 1), PhotoID: uint(i + 1), Confidence: 0.99,
+			QualityScore: 0.9, Embedding: model.EncodeEmbedding(vector), ClusterStatus: model.FaceClusterStatusPending}
+		if i >= 5 {
+			personID := uint(1 + (i-5)/2)
+			face.PersonID = &personID
+			face.ClusterStatus = model.FaceClusterStatusAssigned
+		}
+		require.NoError(t, db.Create(face).Error)
+	}
 
 	// 获取测试数据
 	pendingFaces, err := repos.Face.ListPending(peopleClusteringBatchSize)
@@ -43,9 +51,7 @@ func TestClusteringEquivalence(t *testing.T) {
 		t.Fatalf("Failed to list pending faces: %v", err)
 	}
 
-	if len(pendingFaces) == 0 {
-		t.Skip("No pending faces to test")
-	}
+	require.Len(t, pendingFaces, 5)
 
 	assignedPersonIDs, err := repos.Face.ListAssignedPersonIDs()
 	if err != nil {
@@ -60,6 +66,7 @@ func TestClusteringEquivalence(t *testing.T) {
 		}
 	}
 	prototypes := svc.selectPersonPrototypes(protoFaces, peoplePrototypeCount)
+	require.Len(t, prototypes, 2)
 
 	t.Logf("Testing with %d pending faces, %d persons", len(pendingFaces), len(prototypes))
 
@@ -68,6 +75,8 @@ func TestClusteringEquivalence(t *testing.T) {
 		graph1 := svc.buildFaceGraph(pendingFaces)
 		// 运行两次，结果应该相同
 		graph2 := svc.buildFaceGraph(pendingFaces)
+		require.Contains(t, graph1[1], uint(2))
+		require.NotContains(t, graph1[1], uint(3))
 
 		if !graphsEqual(graph1, graph2) {
 			t.Errorf("buildFaceGraph results differ between runs")

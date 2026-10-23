@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,9 +18,11 @@ import (
 )
 
 const (
-	thumbnailPriorityScan    = 50
-	thumbnailPriorityManual  = 80
-	thumbnailPriorityPassive = 100
+	thumbnailPriorityScan      = 50
+	thumbnailPriorityManual    = 80
+	thumbnailPriorityPassive   = 100
+	thumbnailJobStaleAfter     = 15 * time.Minute
+	thumbnailHeartbeatInterval = 30 * time.Second
 )
 
 type ThumbnailService interface {
@@ -47,6 +50,8 @@ type thumbnailService struct {
 	active          *activeThumbnailTask
 	backgroundLogMu sync.RWMutex
 	backgroundLogs  []string
+	processingMu    sync.Mutex
+	processing      map[uint]bool
 }
 
 type activeThumbnailTask struct {
@@ -57,14 +62,19 @@ type activeThumbnailTask struct {
 }
 
 func NewThumbnailService(db *gorm.DB, photoRepo repository.PhotoRepository, jobRepo repository.ThumbnailJobRepository, cfg *config.Config) ThumbnailService {
-	return &thumbnailService{
+	s := &thumbnailService{
 		db:         db,
 		photoRepo:  photoRepo,
 		jobRepo:    jobRepo,
 		config:     cfg,
 		generator:  util.NewThumbnailGenerator(1024, 1024, 90, cfg.Photos.ThumbnailPath),
 		writeQueue: database.GetWriteQueue(),
+		processing: make(map[uint]bool),
 	}
+	if err := s.recoverStaleJobs(); err != nil {
+		logger.Warnf("recover interrupted thumbnail jobs on startup: %v", err)
+	}
+	return s
 }
 
 func (s *thumbnailService) StartBackground() (*model.ThumbnailTask, error) {
@@ -245,79 +255,123 @@ func (s *thumbnailService) enqueuePhotoModel(photo *model.Photo, source string, 
 	if priority <= 0 {
 		priority = thumbnailPriorityManual
 	}
-	thumbnailPath := photo.ThumbnailPath
-	if thumbnailPath == "" {
-		thumbnailPath = util.GenerateDerivedImagePath(photo.FilePath)
-	}
-	fullPath := filepath.Join(s.config.Photos.ThumbnailPath, thumbnailPath)
-
-	if !force {
-		if _, err := os.Stat(fullPath); err == nil {
-			// 文件已存在，更新数据库状态为 ready
-			generatedAt := time.Now()
-			updateErr := s.executeWrite(func() error {
-				return s.photoRepo.UpdateFields(photo.ID, map[string]interface{}{
-					"thumbnail_path":         thumbnailPath,
-					"thumbnail_status":       model.ThumbnailStatusReady,
-					"thumbnail_generated_at": &generatedAt,
-				})
-			})
-			if updateErr != nil {
-				logger.Warnf("Update photo %d thumbnail status to ready failed: %v", photo.ID, updateErr)
-				return updateErr
-			}
-			logger.Debugf("Photo %d thumbnail already exists, updated status to ready", photo.ID)
-			return nil
-		}
-	} else {
-		// 强制重新生成：删除旧缩略图文件
-		if _, err := os.Stat(fullPath); err == nil {
-			if err := os.Remove(fullPath); err != nil {
-				logger.Warnf("Failed to remove old thumbnail for photo %d: %v", photo.ID, err)
-			}
-		}
-	}
-
-	now := time.Now()
-	if err := s.executeWrite(func() error {
-		return s.photoRepo.UpdateFields(photo.ID, map[string]interface{}{
-			"thumbnail_path":         thumbnailPath,
-			"thumbnail_status":       model.ThumbnailStatusPending,
-			"thumbnail_generated_at": nil,
-		})
-	}); err != nil {
-		return err
-	}
-
 	activeJob, err := s.jobRepo.GetActiveByPhotoID(photo.ID)
 	if err != nil {
 		return err
 	}
-	if activeJob != nil {
-		updates := map[string]interface{}{
-			"priority":          priority,
-			"source":            source,
-			"last_requested_at": &now,
+	if activeJob != nil && activeJob.Status == model.ThumbnailJobStatusProcessing {
+		if err := s.recoverStaleJob(activeJob, time.Now().Add(-thumbnailJobStaleAfter)); err != nil {
+			return err
 		}
-		if activeJob.Status == model.ThumbnailJobStatusPending {
-			updates["status"] = model.ThumbnailJobStatusQueued
-		}
-		return s.executeWrite(func() error {
-			return s.jobRepo.UpdateFields(activeJob.ID, updates)
-		})
 	}
 
-	job := &model.ThumbnailJob{
-		PhotoID:         photo.ID,
-		FilePath:        photo.FilePath,
-		Status:          model.ThumbnailJobStatusQueued,
-		Priority:        priority,
-		Source:          source,
-		QueuedAt:        now,
-		LastRequestedAt: &now,
+	return s.executeWrite(func() error {
+		return s.db.Transaction(func(tx *gorm.DB) error {
+			jobs := repository.NewThumbnailJobRepository(tx)
+			photos := repository.NewPhotoRepository(tx)
+			current, err := photos.GetByID(photo.ID)
+			if err != nil {
+				return err
+			}
+			if current.Status == model.PhotoStatusExcluded {
+				return nil
+			}
+			activeJob, err := jobs.GetActiveByPhotoID(photo.ID)
+			if err != nil {
+				return err
+			}
+			now := time.Now()
+			if activeJob != nil && activeJob.Status == model.ThumbnailJobStatusProcessing {
+				// Do not delete the file or disturb a live claim. A force request
+				// is retained until this attempt finishes, then queued again.
+				if force {
+					return jobs.UpdateFields(activeJob.ID, map[string]interface{}{
+						"priority": priority, "source": source, "last_requested_at": &now,
+						// Requests are not worker heartbeats.
+						"updated_at": activeJob.UpdatedAt,
+					})
+				}
+				return nil
+			}
+			thumbnailPath := current.ThumbnailPath
+			if thumbnailPath == "" {
+				thumbnailPath = util.GenerateDerivedImagePath(current.FilePath)
+			}
+			if !force && activeJob == nil {
+				if info, err := os.Stat(filepath.Join(s.config.Photos.ThumbnailPath, thumbnailPath)); err == nil && info.Mode().IsRegular() {
+					return photos.UpdateFields(photo.ID, map[string]interface{}{
+						"thumbnail_path": thumbnailPath, "thumbnail_status": model.ThumbnailStatusReady, "thumbnail_generated_at": &now,
+					})
+				}
+			}
+			if err := photos.UpdateFields(photo.ID, map[string]interface{}{
+				"thumbnail_path": thumbnailPath, "thumbnail_status": model.ThumbnailStatusPending, "thumbnail_generated_at": nil,
+			}); err != nil {
+				return err
+			}
+			if activeJob != nil {
+				return jobs.UpdateFields(activeJob.ID, map[string]interface{}{
+					"status": model.ThumbnailJobStatusQueued, "priority": priority, "source": source, "last_requested_at": &now,
+				})
+			}
+			return jobs.Create(&model.ThumbnailJob{
+				PhotoID: photo.ID, FilePath: current.FilePath, Status: model.ThumbnailJobStatusQueued,
+				Priority: priority, Source: source, QueuedAt: now, LastRequestedAt: &now,
+			})
+		})
+	})
+}
+
+// Recover only expired claims. Local in-flight work is also excluded: a busy
+// SQLite write queue must not cause this process to steal its own live worker.
+func (s *thumbnailService) recoverStaleJobs() error {
+	cutoff := time.Now().Add(-thumbnailJobStaleAfter)
+	jobs, err := s.jobRepo.ListStaleProcessing(cutoff)
+	if err != nil {
+		return err
+	}
+	for i := range jobs {
+		if err := s.recoverStaleJob(&jobs[i], cutoff); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *thumbnailService) recoverStaleJob(job *model.ThumbnailJob, cutoff time.Time) error {
+	if !job.UpdatedAt.Before(cutoff) {
+		return nil
+	}
+	s.processingMu.Lock()
+	defer s.processingMu.Unlock()
+	if s.processing[job.ID] {
+		return nil
+	}
+	photo, err := s.photoRepo.GetByID(job.PhotoID)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	now := time.Now()
+	updates := map[string]interface{}{
+		"status": model.ThumbnailJobStatusQueued, "started_at": nil, "completed_at": nil,
+		"queued_at": now, "last_error": "recovered interrupted thumbnail attempt",
+	}
+	if photo == nil || errors.Is(err, gorm.ErrRecordNotFound) || photo.Status == model.PhotoStatusExcluded {
+		updates["status"] = model.ThumbnailJobStatusCancelled
+		updates["completed_at"] = &now
+		updates["started_at"] = job.StartedAt
+	} else if photo.ThumbnailStatus == model.ThumbnailStatusReady && photo.ThumbnailPath != "" &&
+		(job.LastRequestedAt == nil || job.StartedAt == nil || !job.LastRequestedAt.After(*job.StartedAt)) {
+		if info, err := os.Stat(filepath.Join(s.config.Photos.ThumbnailPath, photo.ThumbnailPath)); err == nil && info.Mode().IsRegular() {
+			updates["status"] = model.ThumbnailJobStatusCompleted
+			updates["completed_at"] = &now
+			updates["started_at"] = job.StartedAt
+			updates["last_error"] = ""
+		}
 	}
 	return s.executeWrite(func() error {
-		return s.jobRepo.Create(job)
+		_, err := s.jobRepo.UpdateStaleProcessing(job, cutoff, updates)
+		return err
 	})
 }
 
@@ -343,6 +397,9 @@ func (s *thumbnailService) runBackground(active *activeThumbnailTask) {
 		logger.Info("Thumbnail background task stopped")
 	}()
 
+	if err := s.recoverStaleJobs(); err != nil {
+		logger.Warnf("recover interrupted thumbnail jobs: %v", err)
+	}
 	s.appendBackgroundLog("正在检查待处理任务...")
 	if err := s.seedPendingJobs(); err != nil {
 		logger.Warnf("seed thumbnail jobs failed: %v", err)
@@ -362,122 +419,181 @@ func (s *thumbnailService) runBackground(active *activeThumbnailTask) {
 	if workers < maxWorkers {
 		maxWorkers = workers
 	}
-	jobCh := make(chan *model.ThumbnailJob, maxWorkers*2)
 	var wg sync.WaitGroup
 	for i := 0; i < maxWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobCh {
-				if err := s.processJob(job); err != nil {
-					logger.Warnf("process thumbnail job %d failed: %v", job.ID, err)
+			for {
+				select {
+				case <-active.stopCh:
+					return
+				default:
 				}
-				// 任务完成后短暂暂停，减少数据库写入冲突
-				time.Sleep(50 * time.Millisecond)
+				// Claim only when a worker is ready; buffered claims would have
+				// no heartbeat while waiting behind a slow image decode.
+				job, err := s.jobRepo.ClaimNextJob()
+				if err != nil {
+					logger.Warnf("claim thumbnail job failed: %v", err)
+				}
+				delay := 500 * time.Millisecond
+				if job != nil {
+					delay = 50 * time.Millisecond
+					s.updateTaskProgress(func(task *model.ThumbnailTask) {
+						task.CurrentPhotoID = job.PhotoID
+						task.CurrentFile = filepath.Base(job.FilePath)
+					})
+					if err := s.processJob(job); err != nil {
+						logger.Warnf("process thumbnail job %d failed: %v", job.ID, err)
+					}
+				}
+				select {
+				case <-active.stopCh:
+					return
+				case <-time.After(delay):
+				}
 			}
 		}()
 	}
-
-	s.appendBackgroundLog("开始处理缩略图任务队列...")
-	logger.Info("Starting thumbnail job processing loop")
-	claimAttempt := 0
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
 	for {
-		active.mu.Lock()
-		stopRequested := active.stop
-		active.mu.Unlock()
-		if stopRequested {
-			logger.Info("Stop requested, exiting processing loop")
-			break
+		select {
+		case <-active.stopCh:
+			wg.Wait()
+			return
+		case <-ticker.C:
+			if err := s.recoverStaleJobs(); err != nil {
+				logger.Warnf("recover interrupted thumbnail jobs: %v", err)
+			}
 		}
-
-		claimAttempt++
-		if claimAttempt%100 == 1 {
-			logger.Debugf("Attempting to claim job (attempt %d)", claimAttempt)
-		}
-
-		job, err := s.jobRepo.ClaimNextJob()
-		if err != nil {
-			logger.Warnf("claim thumbnail job failed: %v", err)
-			s.appendBackgroundLog(fmt.Sprintf("领取缩略图任务失败：%v", err))
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-		if job == nil {
-			time.Sleep(500 * time.Millisecond)
-			continue
-		}
-
-		s.updateTaskProgress(func(task *model.ThumbnailTask) {
-			task.CurrentPhotoID = job.PhotoID
-			task.CurrentFile = filepath.Base(job.FilePath)
-		})
-		s.appendBackgroundLog(fmt.Sprintf("开始生成照片 #%d 的缩略图 (%s)", job.PhotoID, filepath.Base(job.FilePath)))
-		jobCh <- job
-		// 领取任务后短暂暂停，避免过快消耗任务导致数据库竞争
-		time.Sleep(100 * time.Millisecond)
 	}
-
-	close(jobCh)
-	wg.Wait()
 }
 
 func (s *thumbnailService) processJob(job *model.ThumbnailJob) error {
+	s.processingMu.Lock()
+	s.processing[job.ID] = true
+	s.processingMu.Unlock()
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		ticker := time.NewTicker(thumbnailHeartbeatInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				return
+			case <-ticker.C:
+				var owned bool
+				err := s.executeWrite(func() error {
+					var err error
+					owned, err = s.jobRepo.UpdateProcessing(job, map[string]interface{}{"updated_at": time.Now()})
+					return err
+				})
+				if err != nil {
+					logger.Warnf("heartbeat thumbnail job %d: %v", job.ID, err)
+				} else if !owned {
+					return
+				}
+			}
+		}
+	}()
+	defer func() {
+		close(stopHeartbeat)
+		<-heartbeatDone
+		s.processingMu.Lock()
+		delete(s.processing, job.ID)
+		s.processingMu.Unlock()
+	}()
+
 	photo, err := s.photoRepo.GetByID(job.PhotoID)
-	if err != nil {
-		now := time.Now()
-		_ = s.executeWrite(func() error {
-			return s.jobRepo.UpdateFields(job.ID, map[string]interface{}{"status": model.ThumbnailJobStatusFailed, "last_error": err.Error(), "completed_at": &now})
-		})
-		return err
+	if err != nil || photo == nil {
+		if err == nil {
+			err = fmt.Errorf("photo %d not found", job.PhotoID)
+		}
+		return s.finishJob(job, nil, "", "", err)
 	}
 	if photo.Status == model.PhotoStatusExcluded {
-		now := time.Now()
-		_ = s.executeWrite(func() error {
-			return s.jobRepo.UpdateFields(job.ID, map[string]interface{}{"status": model.ThumbnailJobStatusCancelled, "completed_at": &now})
-		})
-		s.updateTaskProgress(func(task *model.ThumbnailTask) { task.ProcessedJobs++ })
-		return nil
+		return s.finishJob(job, photo, "", "", nil)
 	}
-	relPath, err := s.generator.GenerateThumbnailWithRotation(photo.FilePath, photo.ManualRotation)
-	now := time.Now()
+	// Render to an attempt-specific directory. An expired worker can never
+	// overwrite the current thumbnail before its claim is checked below.
+	if err := os.MkdirAll(s.config.Photos.ThumbnailPath, 0755); err != nil {
+		return s.finishJob(job, photo, "", "", err)
+	}
+	tempDir, err := os.MkdirTemp(s.config.Photos.ThumbnailPath, ".thumbnail-job-")
 	if err != nil {
-		// 使用带重试的更新
-		_ = s.updatePhotoWithRetry(photo.ID, map[string]interface{}{
-			"thumbnail_status": model.ThumbnailStatusFailed,
-		})
-		_ = s.updateJobWithRetry(job.ID, map[string]interface{}{"status": model.ThumbnailJobStatusFailed, "last_error": err.Error(), "completed_at": &now})
-		s.updateTaskProgress(func(task *model.ThumbnailTask) {
-			task.ProcessedJobs++
-		})
-		s.appendBackgroundLog(fmt.Sprintf("生成照片 #%d 缩略图失败：%v", photo.ID, err))
-		return err
+		return s.finishJob(job, photo, "", "", err)
 	}
-	// 批量更新 photo 和 job，减少数据库操作次数
-	if err := s.updatePhotoWithRetry(photo.ID, map[string]interface{}{
-		"thumbnail_path":         relPath,
-		"thumbnail_status":       model.ThumbnailStatusReady,
-		"thumbnail_generated_at": &now,
-	}); err != nil {
-		logger.Warnf("update photo %d after thumbnail success failed: %v", photo.ID, err)
-	}
-	if err := s.updateJobWithRetry(job.ID, map[string]interface{}{"status": model.ThumbnailJobStatusCompleted, "completed_at": &now, "last_error": ""}); err != nil {
-		logger.Warnf("update thumbnail job %d status failed: %v", job.ID, err)
-	}
-	s.updateTaskProgress(func(task *model.ThumbnailTask) {
-		task.ProcessedJobs++
-	})
-	s.appendBackgroundLog(fmt.Sprintf("生成照片 #%d 缩略图成功", photo.ID))
-	return nil
+	defer os.RemoveAll(tempDir)
+	generator := util.NewThumbnailGenerator(1024, 1024, 90, tempDir)
+	relPath, generateErr := generator.GenerateThumbnailWithRotation(photo.FilePath, photo.ManualRotation)
+	return s.finishJob(job, photo, tempDir, relPath, generateErr)
 }
 
-// updatePhotoWithRetry uses WriteQueue to serialize DB writes
-func (s *thumbnailService) updatePhotoWithRetry(photoID uint, updates map[string]interface{}) error {
-	if s.writeQueue == nil {
-		return s.photoRepo.UpdateFields(photoID, updates)
-	}
-	return s.writeQueue.Execute(func() error {
-		return s.photoRepo.UpdateFields(photoID, updates)
+func (s *thumbnailService) finishJob(job *model.ThumbnailJob, photo *model.Photo, tempDir, relPath string, generateErr error) error {
+	err := s.executeWrite(func() error {
+		return s.db.Transaction(func(tx *gorm.DB) error {
+			jobs := repository.NewThumbnailJobRepository(tx)
+			current, err := jobs.GetByID(job.ID)
+			if err != nil {
+				return err
+			}
+			if current == nil {
+				return fmt.Errorf("thumbnail job %d no longer exists", job.ID)
+			}
+			now := time.Now()
+			updates := map[string]interface{}{"status": model.ThumbnailJobStatusCompleted, "completed_at": &now, "last_error": ""}
+			photoUpdates := map[string]interface{}{"thumbnail_path": relPath, "thumbnail_status": model.ThumbnailStatusReady, "thumbnail_generated_at": &now}
+			if generateErr != nil {
+				updates["status"] = model.ThumbnailJobStatusFailed
+				updates["last_error"] = generateErr.Error()
+				photoUpdates = map[string]interface{}{"thumbnail_status": model.ThumbnailStatusFailed}
+			} else if photo != nil && photo.Status == model.PhotoStatusExcluded {
+				updates["status"] = model.ThumbnailJobStatusCancelled
+				photoUpdates = nil
+			}
+			if photo != nil && photo.Status != model.PhotoStatusExcluded && current.LastRequestedAt != nil &&
+				job.StartedAt != nil && current.LastRequestedAt.After(*job.StartedAt) {
+				updates["status"] = model.ThumbnailJobStatusQueued
+				updates["started_at"] = nil
+				updates["completed_at"] = nil
+				updates["queued_at"] = now
+				photoUpdates = map[string]interface{}{"thumbnail_status": model.ThumbnailStatusPending, "thumbnail_generated_at": nil}
+			}
+			owned, err := jobs.UpdateProcessing(job, updates)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				return fmt.Errorf("thumbnail job %d claim was replaced", job.ID)
+			}
+			if generateErr == nil && relPath != "" {
+				dest := filepath.Join(s.config.Photos.ThumbnailPath, relPath)
+				if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+					return err
+				}
+				if err := os.Rename(filepath.Join(tempDir, relPath), dest); err != nil {
+					return err
+				}
+			}
+			if photo != nil && photoUpdates != nil {
+				return repository.NewPhotoRepository(tx).UpdateFields(photo.ID, photoUpdates)
+			}
+			return nil
+		})
 	})
+	if err != nil {
+		return err
+	}
+	s.updateTaskProgress(func(task *model.ThumbnailTask) { task.ProcessedJobs++ })
+	if generateErr != nil {
+		s.appendBackgroundLog(fmt.Sprintf("生成照片 #%d 缩略图失败：%v", job.PhotoID, generateErr))
+		return generateErr
+	}
+	s.appendBackgroundLog(fmt.Sprintf("照片 #%d 缩略图任务已处理", job.PhotoID))
+	return nil
 }
 
 // executeWrite runs fn through WriteQueue if available, otherwise directly.
@@ -486,16 +602,6 @@ func (s *thumbnailService) executeWrite(fn func() error) error {
 		return s.writeQueue.Execute(fn)
 	}
 	return fn()
-}
-
-// updateJobWithRetry uses WriteQueue to serialize DB writes
-func (s *thumbnailService) updateJobWithRetry(jobID uint, updates map[string]interface{}) error {
-	if s.writeQueue == nil {
-		return s.jobRepo.UpdateFields(jobID, updates)
-	}
-	return s.writeQueue.Execute(func() error {
-		return s.jobRepo.UpdateFields(jobID, updates)
-	})
 }
 
 // isSQLiteLockError 检查错误是否是 SQLite 锁定错误
@@ -559,17 +665,21 @@ func (s *thumbnailService) seedPendingJobs() error {
 
 	// 先收集所有需要处理的照片ID，避免在FindInBatches回调中进行写入操作（排除 excluded 照片）
 	var photoIDs []uint
-	err = s.db.Model(&model.Photo{}).
-		Select("id").
-		Where("status = ?", model.PhotoStatusActive).
-		Where("thumbnail_status != ? OR thumbnail_status IS NULL OR thumbnail_path = ''", model.ThumbnailStatusReady).
-		FindInBatches(&photoIDs, 500, func(tx *gorm.DB, batch int) error {
-			logger.Debugf("Collecting batch %d, IDs in batch: %d", batch, len(photoIDs))
-			return nil
-		}).Error
-	if err != nil {
-		logger.Errorf("FindInBatches failed: %v", err)
-		return err
+	var lastID uint
+	for {
+		var batch []uint
+		err = s.db.Model(&model.Photo{}).
+			Where("status = ? AND id > ?", model.PhotoStatusActive, lastID).
+			Where("thumbnail_status != ? OR thumbnail_status IS NULL OR thumbnail_path = ''", model.ThumbnailStatusReady).
+			Order("id ASC").Limit(500).Pluck("id", &batch).Error
+		if err != nil {
+			return err
+		}
+		if len(batch) == 0 {
+			break
+		}
+		photoIDs = append(photoIDs, batch...)
+		lastID = batch[len(batch)-1]
 	}
 
 	if len(photoIDs) == 0 {

@@ -25,6 +25,9 @@ type ThumbnailJobRepository interface {
 	GetByID(id uint) (*model.ThumbnailJob, error)
 	GetActiveByPhotoID(photoID uint) (*model.ThumbnailJob, error)
 	ClaimNextJob() (*model.ThumbnailJob, error)
+	ListStaleProcessing(cutoff time.Time) ([]model.ThumbnailJob, error)
+	UpdateProcessing(job *model.ThumbnailJob, fields map[string]interface{}) (bool, error)
+	UpdateStaleProcessing(job *model.ThumbnailJob, cutoff time.Time, fields map[string]interface{}) (bool, error)
 	CancelPendingJobs() (int64, error)
 	GetStats() (*ThumbnailJobStats, error)
 	DeleteTerminalBefore(cutoff time.Time) (int64, error)
@@ -93,6 +96,8 @@ func (r *thumbnailJobRepository) ClaimNextJob() (*model.ThumbnailJob, error) {
 	updates := map[string]interface{}{
 		"status":        model.ThumbnailJobStatusProcessing,
 		"started_at":    &now,
+		"completed_at":  nil,
+		"last_error":    "",
 		"attempt_count": gorm.Expr("attempt_count + 1"),
 	}
 
@@ -111,7 +116,38 @@ func (r *thumbnailJobRepository) ClaimNextJob() (*model.ThumbnailJob, error) {
 	job.Status = model.ThumbnailJobStatusProcessing
 	job.StartedAt = &now
 	job.AttemptCount++
+	job.UpdatedAt = now
+	job.CompletedAt = nil
+	job.LastError = ""
 	return &job, nil
+}
+
+func (r *thumbnailJobRepository) ListStaleProcessing(cutoff time.Time) ([]model.ThumbnailJob, error) {
+	var jobs []model.ThumbnailJob
+	err := r.db.Where("status = ? AND updated_at < ?", model.ThumbnailJobStatusProcessing, cutoff).
+		Order("id ASC").Find(&jobs).Error
+	return jobs, err
+}
+
+// A claim is identified by its attempt and start time, so an interrupted worker
+// cannot heartbeat or finish a later attempt of the same job.
+func (r *thumbnailJobRepository) processingClaim(job *model.ThumbnailJob) *gorm.DB {
+	query := r.db.Model(&model.ThumbnailJob{}).
+		Where("id = ? AND status = ? AND attempt_count = ?", job.ID, model.ThumbnailJobStatusProcessing, job.AttemptCount)
+	if job.StartedAt == nil {
+		return query.Where("started_at IS NULL")
+	}
+	return query.Where("started_at = ?", job.StartedAt)
+}
+
+func (r *thumbnailJobRepository) UpdateProcessing(job *model.ThumbnailJob, fields map[string]interface{}) (bool, error) {
+	result := r.processingClaim(job).Updates(fields)
+	return result.RowsAffected > 0, result.Error
+}
+
+func (r *thumbnailJobRepository) UpdateStaleProcessing(job *model.ThumbnailJob, cutoff time.Time, fields map[string]interface{}) (bool, error) {
+	result := r.processingClaim(job).Where("updated_at < ?", cutoff).Updates(fields)
+	return result.RowsAffected > 0, result.Error
 }
 
 func (r *thumbnailJobRepository) CancelPendingJobs() (int64, error) {

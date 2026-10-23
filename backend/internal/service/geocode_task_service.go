@@ -328,10 +328,7 @@ func (s *geocodeTaskService) enqueuePhotoModel(photo *model.Photo, source string
 		return nil
 	}
 	// 排除无效 GPS 坐标（为 nil 或为 0,0）
-	if photo.GPSLatitude == nil || photo.GPSLongitude == nil {
-		return nil
-	}
-	if *photo.GPSLatitude == 0 && *photo.GPSLongitude == 0 {
+	if !photo.HasGPS() {
 		return nil
 	}
 	if source == "" {
@@ -416,8 +413,7 @@ func (s *geocodeTaskService) runBackground(active *activeGeocodeTask) {
 			s.appendBackgroundLog(fmt.Sprintf("获取照片 #%d 失败：%v", job.PhotoID, err))
 			continue
 		}
-		if photo.GPSLatitude == nil || photo.GPSLongitude == nil ||
-			(*photo.GPSLatitude == 0 && *photo.GPSLongitude == 0) {
+		if !photo.HasGPS() {
 			now := time.Now()
 			_ = s.updateJobWithRetry(job.ID, map[string]interface{}{"status": model.GeocodeJobStatusCancelled, "completed_at": &now})
 			s.updateTaskProgress(func(task *model.GeocodeTask) { task.ProcessedJobs++ })
@@ -491,7 +487,7 @@ func (s *geocodeTaskService) runRegeocodeAll(active *activeGeocodeTask) {
 
 	total := 0
 	for _, p := range photos {
-		if p.GPSLatitude != nil && p.GPSLongitude != nil && !(*p.GPSLatitude == 0 && *p.GPSLongitude == 0) && p.Status == model.PhotoStatusActive {
+		if p.HasGPS() && p.Status == model.PhotoStatusActive {
 			total++
 		}
 	}
@@ -509,10 +505,7 @@ func (s *geocodeTaskService) runRegeocodeAll(active *activeGeocodeTask) {
 			break
 		}
 
-		if photo.GPSLatitude == nil || photo.GPSLongitude == nil {
-			continue
-		}
-		if *photo.GPSLatitude == 0 && *photo.GPSLongitude == 0 {
+		if !photo.HasGPS() {
 			continue
 		}
 		if photo.Status == model.PhotoStatusExcluded {
@@ -597,8 +590,7 @@ func (s *geocodeTaskService) seedPendingJobs() error {
 	// 排除 GPS 为 0,0 的无效坐标，排除 excluded 照片
 	err = s.db.Model(&model.Photo{}).
 		Where("status = ?", model.PhotoStatusActive).
-		Where("gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL").
-		Where("gps_latitude != 0 OR gps_longitude != 0").
+		Scopes(repository.WithValidGPS).
 		Where("(geocode_status != ? OR geocode_status IS NULL)", model.GeocodeStatusReady).
 		FindInBatches(&photos, 200, func(tx *gorm.DB, batch int) error {
 			for i := range photos {

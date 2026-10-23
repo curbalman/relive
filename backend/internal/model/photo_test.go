@@ -55,6 +55,7 @@ func TestPhoto_IsAnalyzed(t *testing.T) {
 func TestPhoto_HasGPS(t *testing.T) {
 	lat := 39.9
 	lon := 116.4
+	zero := 0.0
 
 	tests := []struct {
 		name string
@@ -63,6 +64,9 @@ func TestPhoto_HasGPS(t *testing.T) {
 		want bool
 	}{
 		{"both set", &lat, &lon, true},
+		{"zero placeholder", &zero, &zero, false},
+		{"equator", &zero, &lon, true},
+		{"prime meridian", &lat, &zero, true},
 		{"lat nil", nil, &lon, false},
 		{"lon nil", &lat, nil, false},
 		{"both nil", nil, nil, false},

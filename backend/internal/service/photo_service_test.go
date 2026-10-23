@@ -22,7 +22,7 @@ import (
 func newAutoScanTestService(t *testing.T, rootPath string) (*photoService, ConfigService) {
 	t.Helper()
 
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(filepath.Join(t.TempDir(), "scan.db")), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("open test db: %v", err)
 	}
@@ -47,6 +47,20 @@ func newAutoScanTestService(t *testing.T, rootPath string) (*photoService, Confi
 	cfg.Photos.ThumbnailPath = filepath.Join(rootPath, ".thumbnails")
 	cfg.Performance.MaxScanWorkers = 1
 	service := NewPhotoService(photoRepo, nil, db, scanJobRepo, cfg, configService, nil, nil, nil).(*photoService)
+	t.Cleanup(func() {
+		service.taskMutex.RLock()
+		active := service.activeJob
+		service.taskMutex.RUnlock()
+		if active != nil {
+			_ = service.HandleShutdown()
+			select {
+			case <-active.done:
+			case <-time.After(3 * time.Second):
+				t.Error("scan worker did not stop")
+			}
+		}
+		_ = sqlDB.Close()
+	})
 	return service, configService
 }
 

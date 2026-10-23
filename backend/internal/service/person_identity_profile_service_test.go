@@ -1327,3 +1327,25 @@ func TestPersonIdentityProfileService_ActivateAfterReadyRebuildsRecall(t *testin
 	require.True(t, ready)
 	assert.Contains(t, got, person.ID, "successful rebuild must restore matching eligibility")
 }
+
+func TestPersonIdentityProfileService_GetOperationalStats_PreservesInactiveHistory(t *testing.T) {
+	svc, deps := newIdentityProfileServiceForTest(t, "shadow", "emb", 5, 0)
+	visible := &model.Person{Category: model.PersonCategoryFriend}
+	hidden := &model.Person{Category: model.PersonCategoryFriend, Hidden: true}
+	removed := &model.Person{Category: model.PersonCategoryFriend}
+	for _, p := range []*model.Person{visible, hidden, removed} {
+		require.NoError(t, deps.repos.Person.Create(p))
+		require.NoError(t, svc.MarkDirty([]uint{p.ID}, "manual"))
+	}
+	require.NoError(t, deps.db.Delete(removed).Error)
+
+	resp, err := svc.GetOperationalStats(deps.repos.IdentityDecision)
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), resp.Profiles.Total)
+	assert.Equal(t, int64(1), resp.Profiles.Dirty)
+	assert.Equal(t, int64(1), resp.Profiles.Hidden.Total)
+	assert.Equal(t, int64(1), resp.Profiles.Hidden.Dirty)
+	assert.Equal(t, int64(1), resp.Profiles.Orphaned.Total)
+	assert.Equal(t, int64(1), resp.Profiles.Orphaned.Dirty)
+	assert.Equal(t, int64(1), resp.Backfill.TotalPeople)
+}

@@ -161,8 +161,9 @@ type PersonIdentityProfileBuild struct {
 	ExpectedChangeRevision int
 }
 
-// PersonIdentityProfileStats 汇总身份画像的运行状态：各 status 的 profile 计数、
-// 人物总数与 backfill 进度。由 repository 提供原始计数，service 补充 backfill 游标。
+// PersonIdentityProfileStats 汇总有效身份画像的运行状态：仍存在、未隐藏人物的
+// 各 status 画像计数、人物总数与 backfill 进度；隐藏与孤立画像另列为历史记录。
+// 由 repository 提供原始计数，service 补充 backfill 游标。
 // legacy 模式下 service 返回零值结构而不查询数据库。
 //
 // Task 14 起新增 center/member 活动聚合统计字段，供只读运行状态接口使用。
@@ -177,8 +178,11 @@ type PersonIdentityProfileStats struct {
 	BackfillCursor    uint  `json:"backfill_cursor"`
 	BackfillCompleted bool  `json:"backfill_completed"`
 
+	Hidden   IdentityProfileStatusCounts `json:"hidden"`
+	Orphaned IdentityProfileStatusCounts `json:"orphaned"`
+
 	// Center 聚合：仅统计活动 generation（center.generation = profile.active_generation，
-	// profile.status=ready，active_generation>0，对应 people 仍存在）的中心。
+	// profile.status=ready，active_generation>0，对应 people 仍存在且未隐藏）的中心。
 	CenterTotal          int64   `json:"center_total"`
 	CenterActive         int64   `json:"center_active"`
 	CenterConfirmed      int64   `json:"center_confirmed"`

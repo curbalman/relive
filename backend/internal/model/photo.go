@@ -211,9 +211,9 @@ func (p *Photo) IsAnalyzed() bool {
 	return p.AIAnalyzed && p.AnalyzedAt != nil
 }
 
-// HasGPS 是否有 GPS 信息
+// HasGPS 是否有可用 GPS 信息；(0,0) 为占位值，单个零坐标仍有效。
 func (p *Photo) HasGPS() bool {
-	return p.GPSLatitude != nil && p.GPSLongitude != nil
+	return p.GPSLatitude != nil && p.GPSLongitude != nil && (*p.GPSLatitude != 0 || *p.GPSLongitude != 0)
 }
 
 // IsActive 是否为正常状态

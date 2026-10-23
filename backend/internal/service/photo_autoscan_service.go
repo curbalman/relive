@@ -377,8 +377,10 @@ func (s *photoService) updateScanTreeSnapshotWithSnapshot(scanPath string, snaps
 	if err != nil {
 		return fmt.Errorf("load scan paths config: %w", err)
 	}
+	scanPath = filepath.Clean(scanPath)
 	for _, path := range pathsCfg.Paths {
-		if path.Path != scanPath {
+		root := filepath.Clean(path.Path)
+		if !scanPathContains(root, scanPath) && !scanPathContains(scanPath, root) {
 			continue
 		}
 		if snapshot == nil {
@@ -387,7 +389,53 @@ func (s *photoService) updateScanTreeSnapshotWithSnapshot(scanPath string, snaps
 				return err
 			}
 		}
-		return s.saveScanTreeSnapshot(path.ID, snapshot)
+		updated := &scanTreeSnapshot{RootPath: root, GeneratedAt: snapshot.GeneratedAt}
+		if scanPathContains(scanPath, root) {
+			// A full scan may cover several configured roots. Keep only the nodes
+			// belonging to this root, without walking directories a second time.
+			for _, node := range snapshot.Nodes {
+				if scanPathContains(root, node.Path) {
+					updated.Nodes = append(updated.Nodes, node)
+				}
+			}
+			rootVisited := false
+			for _, node := range updated.Nodes {
+				if filepath.Clean(node.Path) == root {
+					rootVisited = true
+					break
+				}
+			}
+			// A configured subtree may be temporarily missing, unreadable or
+			// excluded by a parent scan. An empty baseline would never notice
+			// its return, so retain the last successful observation instead.
+			if !rootVisited {
+				continue
+			}
+		} else {
+			previous, err := s.loadScanTreeSnapshot(path.ID)
+			if err != nil {
+				return err
+			}
+			// Without a baseline for the parent, a partial scan cannot acknowledge
+			// its unvisited siblings. Let the normal initial/full scan establish it.
+			if previous == nil || filepath.Clean(previous.RootPath) != root {
+				continue
+			}
+			for _, node := range previous.Nodes {
+				if !scanPathContains(scanPath, node.Path) {
+					updated.Nodes = append(updated.Nodes, node)
+				}
+			}
+			updated.Nodes = append(updated.Nodes, snapshot.Nodes...)
+		}
+		if err := s.saveScanTreeSnapshot(path.ID, updated); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func scanPathContains(root, path string) bool {
+	rel, err := filepath.Rel(root, filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }

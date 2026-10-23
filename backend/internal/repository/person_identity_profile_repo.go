@@ -829,41 +829,54 @@ func (r *personIdentityProfileRepository) ListBackfillPersonIDs(cursor uint, lim
 // backfill 游标与完成标志由 service 从持久化状态补充，此处只返回数据库聚合值。
 //
 // 活动中心定义：center.generation = profile.active_generation、profile.status=ready、
-// active_generation>0、对应 people 仍存在。活动 member 同理限定 member.generation =
+// active_generation>0、对应 people 仍存在且未隐藏。活动 member 同理限定 member.generation =
 // profile.active_generation。统计全部通过 COUNT/GROUP BY/MAX/AVG 在数据库侧完成，
 // 不加载全部 profile/center/member 到 Go，也不读取 centroid_embedding/sum_embedding。
 func (r *personIdentityProfileRepository) GetStats() (*model.PersonIdentityProfileStats, error) {
 	stats := &model.PersonIdentityProfileStats{}
 
-	rows, err := r.db.Model(&model.PersonIdentityProfile{}).
-		Select("status, COUNT(*) as count").
-		Group("status").
-		Rows()
-	if err != nil {
+	type statusCount struct {
+		Eligibility string
+		Status      string
+		Count       int64
+	}
+	var counts []statusCount
+	if err := r.db.Table("person_identity_profiles AS p").
+		Select("CASE WHEN people.id IS NULL THEN 'orphaned' WHEN people.hidden = 1 THEN 'hidden' ELSE 'eligible' END AS eligibility, p.status, COUNT(*) AS count").
+		Joins("LEFT JOIN people ON people.id = p.person_id").
+		Group("eligibility, p.status").
+		Scan(&counts).Error; err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var status string
-		var count int64
-		if err := rows.Scan(&status, &count); err != nil {
-			return nil, err
+	var eligible model.IdentityProfileStatusCounts
+	for _, row := range counts {
+		group := &eligible
+		switch row.Eligibility {
+		case "hidden":
+			group = &stats.Hidden
+		case "orphaned":
+			group = &stats.Orphaned
 		}
-		stats.Total += count
-		switch status {
+		group.Total += row.Count
+		switch row.Status {
 		case model.PersonIdentityProfileStatusDirty:
-			stats.Dirty = count
+			group.Dirty += row.Count
 		case model.PersonIdentityProfileStatusBuilding:
-			stats.Building = count
+			group.Building += row.Count
 		case model.PersonIdentityProfileStatusReady:
-			stats.Ready = count
+			group.Ready += row.Count
 		case model.PersonIdentityProfileStatusFailed:
-			stats.Failed = count
+			group.Failed += row.Count
 		}
 	}
+	stats.Total = eligible.Total
+	stats.Dirty = eligible.Dirty
+	stats.Building = eligible.Building
+	stats.Ready = eligible.Ready
+	stats.Failed = eligible.Failed
 
 	var people int64
-	if err := r.db.Model(&model.Person{}).Count(&people).Error; err != nil {
+	if err := r.db.Model(&model.Person{}).Where("hidden = ?", false).Count(&people).Error; err != nil {
 		return nil, err
 	}
 	stats.TotalPeople = people
@@ -880,6 +893,7 @@ func (r *personIdentityProfileRepository) GetStats() (*model.PersonIdentityProfi
 		Select("COUNT(*) AS total, SUM(CASE WHEN c.confirmed = 1 THEN 1 ELSE 0 END) AS confirmed").
 		Joins("INNER JOIN person_identity_profiles AS p ON p.person_id = c.person_id").
 		Joins("INNER JOIN people ON people.id = c.person_id").
+		Where("people.hidden = ?", false).
 		Where("c.generation = p.active_generation AND p.active_generation > 0").
 		Where("p.status = ?", model.PersonIdentityProfileStatusReady).
 		Scan(&ca).Error; err != nil {
@@ -895,6 +909,7 @@ func (r *personIdentityProfileRepository) GetStats() (*model.PersonIdentityProfi
 		Select("COUNT(DISTINCT c.person_id)").
 		Joins("INNER JOIN person_identity_profiles AS p ON p.person_id = c.person_id").
 		Joins("INNER JOIN people ON people.id = c.person_id").
+		Where("people.hidden = ?", false).
 		Where("c.generation = p.active_generation AND p.active_generation > 0").
 		Where("p.status = ?", model.PersonIdentityProfileStatusReady).
 		Scan(&activeProfiles).Error; err != nil {
@@ -907,6 +922,7 @@ func (r *personIdentityProfileRepository) GetStats() (*model.PersonIdentityProfi
 		Select("COUNT(*) AS cnt").
 		Joins("INNER JOIN person_identity_profiles AS p ON p.person_id = c.person_id").
 		Joins("INNER JOIN people ON people.id = c.person_id").
+		Where("people.hidden = ?", false).
 		Where("c.generation = p.active_generation AND p.active_generation > 0").
 		Where("p.status = ?", model.PersonIdentityProfileStatusReady).
 		Group("c.person_id").
@@ -936,6 +952,7 @@ func (r *personIdentityProfileRepository) GetStats() (*model.PersonIdentityProfi
 			"SUM(CASE WHEN m.state = 'excluded' THEN 1 ELSE 0 END) AS excluded").
 		Joins("INNER JOIN person_identity_profiles AS p ON p.person_id = m.person_id").
 		Joins("INNER JOIN people ON people.id = m.person_id").
+		Where("people.hidden = ?", false).
 		Where("m.generation = p.active_generation AND p.active_generation > 0").
 		Where("p.status = ?", model.PersonIdentityProfileStatusReady).
 		Scan(&ma).Error; err != nil {

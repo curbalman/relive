@@ -1,6 +1,7 @@
 package repository
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -27,12 +28,30 @@ func activeScope(db *gorm.DB) *gorm.DB {
 	return db.Where("status = ?", model.PhotoStatusActive)
 }
 
+// validGPSCondition mirrors Photo.HasGPS: a single zero coordinate is valid,
+// while missing coordinates and the (0,0) placeholder cannot be geocoded.
+const validGPSCondition = "gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL AND (gps_latitude != 0 OR gps_longitude != 0)"
+
+// WithValidGPS keeps geocode job selection and photo statistics on the same population.
+func WithValidGPS(db *gorm.DB) *gorm.DB {
+	return db.Where(validGPSCondition)
+}
+
+// Each eligible photo belongs to exactly one geocode status bucket. A preserved
+// non-empty location remains ready even if a later attempt failed.
+const geocodeStatusAggregate = `
+	SUM(CASE WHEN ` + validGPSCondition + ` THEN 1 ELSE 0 END) as geocode_total,
+	SUM(CASE WHEN (` + validGPSCondition + `) AND (geocode_status = 'ready' OR COALESCE(TRIM(location), '') != '') THEN 1 ELSE 0 END) as geocode_ready,
+	SUM(CASE WHEN (` + validGPSCondition + `) AND geocode_status = 'failed' AND COALESCE(TRIM(location), '') = '' THEN 1 ELSE 0 END) as geocode_failed,
+	SUM(CASE WHEN (` + validGPSCondition + `) AND COALESCE(geocode_status, '') NOT IN ('ready', 'failed') AND COALESCE(TRIM(location), '') = '' THEN 1 ELSE 0 END) as geocode_pending`
+
 // PhotoRepository 照片仓库接口
 type PhotoRepository interface {
 	// 基础 CRUD
 	Create(photo *model.Photo) error
 	Update(photo *model.Photo) error
 	UpdateFields(id uint, fields map[string]interface{}) error
+	UpdateAnalysisWithLease(ctx context.Context, ownerType, ownerID string, id uint, fields map[string]interface{}, tags string, syncTags bool) (bool, error)
 	Delete(id uint) error
 	// DeleteTx 在已有事务内删除照片（用于跨表原子删除）
 	DeleteTx(tx *gorm.DB, id uint) error
@@ -253,9 +272,9 @@ func (r *photoRepository) applyPhotoFilters(query *gorm.DB, analyzed *bool, hasT
 	}
 	if hasGPS != nil {
 		if *hasGPS {
-			query = query.Where("gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL")
+			query = query.Scopes(WithValidGPS)
 		} else {
-			query = query.Where("gps_latitude IS NULL OR gps_longitude IS NULL")
+			query = query.Where("NOT (" + validGPSCondition + ")")
 		}
 	}
 	if location != "" {
@@ -1060,11 +1079,7 @@ func (r *photoRepository) GetDerivedStatusByPathPrefix(prefix string) (*model.Pa
 			SUM(CASE WHEN thumbnail_status = 'ready' THEN 1 ELSE 0 END) as thumbnail_ready,
 			SUM(CASE WHEN thumbnail_status = 'failed' THEN 1 ELSE 0 END) as thumbnail_failed,
 			SUM(CASE WHEN thumbnail_status NOT IN ('ready', 'failed') OR thumbnail_status IS NULL THEN 1 ELSE 0 END) as thumbnail_pending,
-			SUM(CASE WHEN gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL THEN 1 ELSE 0 END) as geocode_total,
-			SUM(CASE WHEN (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL) AND (geocode_status = 'ready' OR (COALESCE(TRIM(location), '') != '')) THEN 1 ELSE 0 END) as geocode_ready,
-			SUM(CASE WHEN (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL) AND geocode_status = 'failed' THEN 1 ELSE 0 END) as geocode_failed,
-			SUM(CASE WHEN (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL) AND geocode_status != 'ready' AND geocode_status != 'failed' AND (COALESCE(TRIM(location), '') = '') THEN 1 ELSE 0 END) as geocode_pending
-		`).
+		` + geocodeStatusAggregate).
 		Scan(&result).Error
 
 	return &result, err
@@ -1109,7 +1124,7 @@ func (r *photoRepository) CountTags() (int64, error) {
 // ListWithGPS 获取所有有GPS坐标的照片
 func (r *photoRepository) ListWithGPS() ([]*model.Photo, error) {
 	var photos []*model.Photo
-	err := r.db.Scopes(activeScope).Where("gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL").Find(&photos).Error
+	err := r.db.Scopes(activeScope, WithValidGPS).Find(&photos).Error
 	return photos, err
 }
 
@@ -1346,10 +1361,7 @@ func (r *photoRepository) GetDerivedStatusByPathPrefixes(prefixes []string) (map
 		SUM(CASE WHEN thumbnail_status = 'ready' THEN 1 ELSE 0 END) as thumbnail_ready,
 		SUM(CASE WHEN thumbnail_status = 'failed' THEN 1 ELSE 0 END) as thumbnail_failed,
 		SUM(CASE WHEN thumbnail_status NOT IN ('ready', 'failed') OR thumbnail_status IS NULL THEN 1 ELSE 0 END) as thumbnail_pending,
-		SUM(CASE WHEN gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL THEN 1 ELSE 0 END) as geocode_total,
-		SUM(CASE WHEN (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL) AND (geocode_status = 'ready' OR (COALESCE(TRIM(location), '') != '')) THEN 1 ELSE 0 END) as geocode_ready,
-		SUM(CASE WHEN (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL) AND geocode_status = 'failed' THEN 1 ELSE 0 END) as geocode_failed,
-		SUM(CASE WHEN (gps_latitude IS NOT NULL AND gps_longitude IS NOT NULL) AND geocode_status != 'ready' AND geocode_status != 'failed' AND (COALESCE(TRIM(location), '') = '') THEN 1 ELSE 0 END) as geocode_pending`
+		` + geocodeStatusAggregate
 
 	err := r.db.Model(&model.Photo{}).Scopes(activeScope).
 		Select(selectExpr).

@@ -2,6 +2,7 @@ package service
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/davidhoo/relive/internal/model"
 	"github.com/davidhoo/relive/internal/repository"
@@ -144,22 +145,29 @@ func (s *configService) validateConfigKey(key string) error {
 
 	// 定义允许的配置键（可选，提高安全性）
 	allowedKeys := map[string]bool{
-		"display.algorithm":         true,
-		"display.refresh_interval":  true,
-		"display.avoid_repeat_days": true,
-		"display.fallback_days":     true,
-		"display.strategy":          true,
-		"photos.auto_scan":          true,
-		"ai.provider":               true,
-		"ai.temperature":            true,
-		"ai.timeout":                true,
-		"system.maintenance_mode":   true,
-		"system.debug_mode":         true,
+		"display.algorithm":                      true,
+		"display.refresh_interval":               true,
+		"display.avoid_repeat_days":              true,
+		"display.fallback_days":                  true,
+		"display.strategy":                       true,
+		"curation.home_base":                     true,
+		"photos.auto_scan":                       true,
+		"photos.scan_paths":                      true,
+		"people.merge_suggestions.state":         true,
+		"people.identity_profile.backfill_state": true,
+		"orientation.suggestions.state":          true,
+		"ai":                                     true,
+		"geocode":                                true,
+		"ai.provider":                            true,
+		"ai.temperature":                         true,
+		"ai.timeout":                             true,
+		"system.maintenance_mode":                true,
+		"system.debug_mode":                      true,
 		// 添加更多允许的配置键...
 	}
 
 	// 如果不在允许列表中，记录警告但不阻止（便于扩展）
-	if !allowedKeys[key] {
+	if !allowedKeys[key] && !strings.HasPrefix(key, "photos.scan_tree.") && !strings.HasPrefix(key, "migration.") {
 		logger.Warnf("Setting non-standard config key: %s", key)
 	}
 

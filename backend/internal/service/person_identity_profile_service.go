@@ -238,7 +238,7 @@ type personIdentityProfileService struct {
 
 // NewPersonIdentityProfileService 构造身份画像服务。
 //
-// bgDB 为专用后台连接池；为 nil 时（创建失败）服务仍可前台 MarkDirty/GetActive/GetStats，
+// bgDB 为专用后台连接池；尚未注入时服务仍可前台 MarkDirty/GetActive/GetStats，
 // 但禁用后台构建。embedding model 标识从 cfg.People.MLEndpoint 派生（embedding 来源），
 // 未配置时使用占位值；测试可直接构造结构体以注入确定值。
 func NewPersonIdentityProfileService(
@@ -323,8 +323,8 @@ func NewPersonIdentityProfileService(
 		// 加载并校验 backfill 状态；版本不一致时重置。
 		svc.loadAndAlignBackfillState()
 	} else if mode != identityProfileModeLegacy && bgDB == nil {
-		logger.Warnf("Identity profile background DB unavailable; background building disabled (mode=%s)", mode)
-		// 即使后台 DB 不可用，ANN 仍初始化（始终 ready=false），以便模式判断一致；
+		logger.Debugf("Identity profile service awaiting background DB initialization (mode=%s)", mode)
+		// 后台 DB 尚未注入时，ANN 仍初始化（始终 ready=false），以便模式判断一致；
 		// 不执行任何后台重建。
 		svc.ann = newIdentityProfileANN(embeddingModel)
 		svc.ann.rebuildRequested.Store(true)
@@ -609,7 +609,6 @@ func (s *personIdentityProfileService) RebuildANNForVerify() {
 	}
 	s.rebuildANNIfNeeded()
 }
-
 
 // rebuildANNIfNeeded 在 rebuildRequested 时从当前可匹配中心重建 ANN snapshot。
 // ListAllActiveCenters 与精排读取共用 matchEligibleCenterQuery：failed/dirty/building、
@@ -919,6 +918,8 @@ func (s *personIdentityProfileService) GetOperationalStats(decisionRepo reposito
 			Dirty:    stats.Dirty,
 			Building: stats.Building,
 			Failed:   stats.Failed,
+			Hidden:   stats.Hidden,
+			Orphaned: stats.Orphaned,
 		},
 		Centers: model.IdentityCenterStats{
 			Total:             stats.CenterTotal,

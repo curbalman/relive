@@ -1470,3 +1470,46 @@ func TestPersonIdentityProfileRepository_EvidenceDirtyResetsExhaustedBudget(t *t
 	assert.False(t, prof.RecoveryExhausted)
 	assert.Equal(t, 0, prof.RecoveryAttempts)
 }
+
+func TestPersonIdentityProfileRepository_GetStats_SeparatesInactiveHistory(t *testing.T) {
+	repo, db := newProfileRepo(t)
+	defer teardownTestDB(db)
+	personRepo := NewPersonRepository(db)
+
+	statuses := []string{model.PersonIdentityProfileStatusDirty, model.PersonIdentityProfileStatusBuilding, model.PersonIdentityProfileStatusReady, model.PersonIdentityProfileStatusFailed}
+	for group := 0; group < 3; group++ {
+		for _, status := range statuses {
+			person := createPerson(t, personRepo)
+			upsertProfileRaw(t, db, personRepo, person.ID, "emb-v1", status, 1)
+			center := insertCenterRaw(t, db, person.ID, 1, 1, 1, 0.9)
+			insertMemberRaw(t, db, person.ID, 1, &center.ID, person.ID+100, model.PersonIdentityMemberStateAccepted)
+			switch group {
+			case 1:
+				require.NoError(t, db.Model(person).Update("hidden", true).Error)
+			case 2:
+				// Simulate retained historical profiles after the person was removed.
+				require.NoError(t, db.Delete(person).Error)
+			}
+		}
+	}
+
+	stats, err := repo.GetStats()
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), stats.Total)
+	assert.Equal(t, int64(4), stats.TotalPeople)
+	assert.Equal(t, int64(1), stats.Dirty)
+	assert.Equal(t, int64(1), stats.Building)
+	assert.Equal(t, int64(1), stats.Ready)
+	assert.Equal(t, int64(1), stats.Failed)
+	wantHistory := model.IdentityProfileStatusCounts{Total: 4, Dirty: 1, Building: 1, Ready: 1, Failed: 1}
+	assert.Equal(t, wantHistory, stats.Hidden)
+	assert.Equal(t, wantHistory, stats.Orphaned)
+	assert.Equal(t, int64(1), stats.CenterActive)
+	assert.Equal(t, int64(1), stats.CenterActiveProfiles)
+	assert.Equal(t, int64(1), stats.MemberTotal)
+
+	// Reading the statistics must not erase any retained historical status.
+	var retained int64
+	require.NoError(t, db.Model(&model.PersonIdentityProfile{}).Count(&retained).Error)
+	assert.Equal(t, int64(12), retained)
+}

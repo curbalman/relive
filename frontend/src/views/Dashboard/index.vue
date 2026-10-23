@@ -188,7 +188,7 @@
                     <span class="recent-photo-status-icon" :class="photo.thumbnail_status === 'ready' ? 'is-ready' : 'is-idle'" title="缩略图状态">
                       <el-icon><Files /></el-icon>
                     </span>
-                    <span class="recent-photo-status-icon" :class="photo.location ? 'is-ready' : 'is-idle'" :title="photo.gps_latitude && photo.gps_longitude ? 'GPS 位置状态' : '无 GPS 信息'">
+                    <span class="recent-photo-status-icon" :class="photo.location ? 'is-ready' : 'is-idle'" :title="hasValidGPS(photo) ? 'GPS 位置状态' : '无 GPS 信息'">
                       <el-icon><Location /></el-icon>
                     </span>
                   </div>
@@ -210,6 +210,7 @@
 </template>
 
 <script setup lang="ts">
+import { hasValidGPS } from '@/utils/gps'
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'

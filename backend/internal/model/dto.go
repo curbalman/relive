@@ -973,13 +973,26 @@ type IdentityProfileOperationalStatsResponse struct {
 	Decisions   IdentityDecisionStats     `json:"decisions"`
 }
 
-// IdentityProfileCountStats 汇总 profile 各 status 计数。
+// IdentityProfileStatusCounts 汇总某个参与资格分组内各状态的画像数量。
+type IdentityProfileStatusCounts struct {
+	Total    int64 `json:"total"`
+	Ready    int64 `json:"ready"`
+	Dirty    int64 `json:"dirty"`
+	Building int64 `json:"building"`
+	Failed   int64 `json:"failed"`
+}
+
+// IdentityProfileCountStats 的原有计数字段仅统计仍存在、未隐藏人物的有效画像。
+// Hidden/Orphaned 单独保留历史状态，不计入有效待办或 Total。
 type IdentityProfileCountStats struct {
 	Total    int64 `json:"total"`
 	Ready    int64 `json:"ready"`
 	Dirty    int64 `json:"dirty"`
 	Building int64 `json:"building"`
 	Failed   int64 `json:"failed"`
+
+	Hidden   IdentityProfileStatusCounts `json:"hidden"`
+	Orphaned IdentityProfileStatusCounts `json:"orphaned"`
 }
 
 // IdentityCenterStats 汇总活动 center 数量与每人物分布。
